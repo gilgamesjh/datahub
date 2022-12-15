@@ -16,7 +16,8 @@ package web
 
 import (
 	"context"
-	"io/ioutil"
+	"github.com/mimiro-io/internal-go-util/pkg/scheduler"
+	"io"
 	"net/http"
 	"net/url"
 
@@ -36,13 +37,14 @@ type JobResponse struct {
 }
 
 type jobsHandler struct {
+	api          *jobs.Api
 	jobScheduler *jobs.Scheduler
 }
 
-func NewJobsHandler(lc fx.Lifecycle, e *echo.Echo, logger *zap.SugaredLogger, mw *Middleware, js *jobs.Scheduler) {
+func NewJobsHandler(lc fx.Lifecycle, e *echo.Echo, logger *zap.SugaredLogger, mw *Middleware, api *jobs.Api, jobScheduler *jobs.Scheduler) {
 	log := logger.Named("web")
 	handler := &jobsHandler{
-		jobScheduler: js,
+		api: api,
 	}
 
 	lc.Append(fx.Hook{
@@ -66,12 +68,17 @@ func NewJobsHandler(lc fx.Lifecycle, e *echo.Echo, logger *zap.SugaredLogger, mw
 }
 
 func (handler *jobsHandler) jobsList(c echo.Context) error {
-	return c.JSON(http.StatusOK, handler.jobScheduler.ListJobs())
+	jobsList, err := handler.api.ListJobs()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	return c.JSON(http.StatusOK, jobsList)
 }
 
 func (handler *jobsHandler) jobsAdd(c echo.Context) error {
 	// read json
-	body, err := ioutil.ReadAll(c.Request().Body)
+	body, err := io.ReadAll(c.Request().Body)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, server.HttpBodyMissingErr(err).Error())
 	}
@@ -92,7 +99,7 @@ func (handler *jobsHandler) jobsAdd(c echo.Context) error {
 func (handler *jobsHandler) jobsGetDefinition(c echo.Context) error {
 	jobId := c.Param("jobid")
 
-	res, err := handler.jobScheduler.LoadJob(jobId)
+	res, err := handler.api.GetJob(scheduler.JobId(jobId))
 	if err != nil || res.Id == "" {
 		return c.NoContent(http.StatusNotFound)
 	}
@@ -102,15 +109,15 @@ func (handler *jobsHandler) jobsGetDefinition(c echo.Context) error {
 }
 
 func (handler *jobsHandler) jobsListSchedules(c echo.Context) error {
-	return c.JSON(http.StatusOK, handler.jobScheduler.GetScheduleEntries())
+	return c.JSON(http.StatusOK, handler.api.GetScheduleEntries())
 }
 
 func (handler *jobsHandler) jobsListStatus(c echo.Context) error {
-	return c.JSON(http.StatusOK, handler.jobScheduler.GetRunningJobs())
+	return c.JSON(http.StatusOK, handler.api.GetRunningJobs())
 }
 
 func (handler *jobsHandler) jobsListHistory(c echo.Context) error {
-	return c.JSON(http.StatusOK, handler.jobScheduler.GetJobHistory())
+	return c.JSON(http.StatusOK, handler.api.GetJobHistory())
 }
 
 // jobsDelete will delete a job with the given jobid if it exists
@@ -119,7 +126,7 @@ func (handler *jobsHandler) jobsListHistory(c echo.Context) error {
 func (handler *jobsHandler) jobsDelete(c echo.Context) error {
 	jobId, _ := url.QueryUnescape(c.Param("jobid"))
 
-	err := handler.jobScheduler.DeleteJob(jobId)
+	err := handler.api.DeleteJob(scheduler.JobId(jobId))
 	if err != nil {
 		return c.NoContent(http.StatusNotFound)
 	}

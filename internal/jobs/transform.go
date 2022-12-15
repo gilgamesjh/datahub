@@ -20,7 +20,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"github.com/mimiro-io/datahub/internal/security"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -37,7 +38,7 @@ import (
 
 type Transform interface {
 	GetConfig() map[string]interface{}
-	transformEntities(runner *Runner, entities []*server.Entity, jobTag string) ([]*server.Entity, error)
+	transformEntities(entities []*server.Entity, jobTag string) ([]*server.Entity, error)
 	getParallelism() int
 }
 
@@ -236,7 +237,7 @@ func (javascriptTransform *JavascriptTransform) getParallelism() int {
 	return javascriptTransform.Parallelism
 }
 
-// clone the transform for use in parallel processing
+// Clone clones the transform for use in parallel processing
 func (javascriptTransform *JavascriptTransform) Clone() (*JavascriptTransform, error) {
 	code := base64.StdEncoding.EncodeToString(javascriptTransform.Code)
 	return newJavascriptTransform(javascriptTransform.Logger, code, javascriptTransform.Store)
@@ -376,14 +377,13 @@ func (javascriptTransform *JavascriptTransform) ToString(obj interface{}) string
 	}
 }
 
-func (javascriptTransform *JavascriptTransform) transformEntities(runner *Runner, entities []*server.Entity, jobTag string) ([]*server.Entity, error) {
+func (javascriptTransform *JavascriptTransform) transformEntities(entities []*server.Entity, jobTag string) ([]*server.Entity, error) {
 
 	var transformFunc func(entities []*server.Entity) (interface{}, error)
 	err := javascriptTransform.Runtime.ExportTo(javascriptTransform.Runtime.Get("transform_entities"), &transformFunc)
 	if err != nil {
 		return nil, err
 	}
-	javascriptTransform.statsDClient = runner.statsdClient
 	javascriptTransform.statsDTags = []string{"application:datahub", "job:" + jobTag}
 	javascriptTransform.timings = map[string]time.Time{}
 
@@ -422,10 +422,11 @@ func (javascriptTransform *JavascriptTransform) GetConfig() map[string]interface
 
 type HttpTransform struct {
 	Url            string
-	Authentication string  // "none, basic, token"
-	User           string  // for use in basic auth
-	Password       string  // for use in basic auth
-	TokenProvider  string  // for use in token auth
+	Authentication string // "none, basic, token"
+	User           string // for use in basic auth
+	Password       string // for use in basic auth
+	TokenProvider  string // for use in token auth
+	TokenProviders *security.TokenProviders
 	TimeOut        float64 // set timeout for http-transform
 }
 
@@ -433,7 +434,7 @@ func (httpTransform *HttpTransform) getParallelism() int {
 	return 1
 }
 
-func (httpTransform *HttpTransform) transformEntities(runner *Runner, entities []*server.Entity, jobTag string) ([]*server.Entity, error) {
+func (httpTransform *HttpTransform) transformEntities(entities []*server.Entity, _ string) ([]*server.Entity, error) {
 
 	timeout := time.Duration(httpTransform.TimeOut) * time.Second
 	client := httpclient.NewClient(httpclient.WithHTTPTimeout(timeout))
@@ -456,7 +457,7 @@ func (httpTransform *HttpTransform) transformEntities(runner *Runner, entities [
 	// security
 	if httpTransform.TokenProvider != "" {
 		// attempt to parse the token provider
-		if provider, ok := runner.tokenProviders.Get(strings.ToLower(httpTransform.TokenProvider)); ok {
+		if provider, ok := httpTransform.TokenProviders.Get(strings.ToLower(httpTransform.TokenProvider)); ok {
 			provider.Authorize(req)
 		}
 	}
@@ -472,7 +473,7 @@ func (httpTransform *HttpTransform) transformEntities(runner *Runner, entities [
 
 	// parse json back into []*Entity
 	defer res.Body.Close()
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, err
 	}

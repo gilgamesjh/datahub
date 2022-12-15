@@ -16,6 +16,7 @@ package web
 
 import (
 	"context"
+	"github.com/mimiro-io/internal-go-util/pkg/scheduler"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
@@ -26,12 +27,14 @@ import (
 
 type jobOperationHandler struct {
 	jobScheduler *jobs.Scheduler
+	api          *jobs.Api
 }
 
-func NewJobOperationHandler(lc fx.Lifecycle, e *echo.Echo, logger *zap.SugaredLogger, mw *Middleware, js *jobs.Scheduler) {
+func NewJobOperationHandler(lc fx.Lifecycle, e *echo.Echo, logger *zap.SugaredLogger, mw *Middleware, api *jobs.Api, js *jobs.Scheduler) {
 	log := logger.Named("web")
 	handler := &jobOperationHandler{
 		jobScheduler: js,
+		api:          api,
 	}
 
 	lc.Append(fx.Hook{
@@ -50,7 +53,7 @@ func NewJobOperationHandler(lc fx.Lifecycle, e *echo.Echo, logger *zap.SugaredLo
 
 func (handler *jobOperationHandler) jobsPause(c echo.Context) error {
 	jobId := c.Param("jobid")
-	err := handler.jobScheduler.PauseJob(jobId)
+	err := handler.api.Operations.Pause(scheduler.JobId(jobId))
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, "could not pause job")
 	}
@@ -59,41 +62,37 @@ func (handler *jobOperationHandler) jobsPause(c echo.Context) error {
 
 func (handler *jobOperationHandler) jobsKill(c echo.Context) error {
 	jobId := c.Param("jobid")
-	handler.jobScheduler.KillJob(jobId)
+	err := handler.api.Operations.Terminate(scheduler.JobId(jobId))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
 	return c.JSON(http.StatusOK, &JobResponse{JobId: jobId})
 }
 
 func (handler *jobOperationHandler) jobsUnpause(c echo.Context) error {
 	jobId := c.Param("jobid")
-	err := handler.jobScheduler.UnpauseJob(jobId)
+	err := handler.api.Operations.Resume(scheduler.JobId(jobId))
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, "could not un-pause job")
+		return echo.NewHTTPError(http.StatusInternalServerError, "could not un-pause job")
 	}
 	return c.JSON(http.StatusOK, &JobResponse{JobId: jobId})
 }
 
 func (handler *jobOperationHandler) jobsRun(c echo.Context) error {
 	jobId := c.Param("jobid")
-	jobType := c.QueryParam("jobType")
-	if len(jobType) == 0 {
-		jobType = jobs.JobTypeIncremental
-	}
-	tempId, err := handler.jobScheduler.RunJob(jobId, jobType)
+	err := handler.api.Operations.Run(scheduler.JobId(jobId))
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, "could not un-pause job")
-	}
-	if tempId == "" {
-		return c.NoContent(http.StatusNotFound)
+		return echo.NewHTTPError(http.StatusInternalServerError, "could not un-pause job")
 	}
 
-	return c.JSON(http.StatusOK, &JobResponse{JobId: tempId})
+	return c.JSON(http.StatusOK, &JobResponse{JobId: "0"})
 }
 
 func (handler *jobOperationHandler) jobsReset(c echo.Context) error {
 	jobId := c.Param("jobid")
 	since := c.QueryParam("since")
 
-	err := handler.jobScheduler.ResetJob(jobId, since)
+	err := handler.api.Operations.Reset(scheduler.JobId(jobId), since)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, "internal error")
 	}
@@ -103,7 +102,7 @@ func (handler *jobOperationHandler) jobsReset(c echo.Context) error {
 func (handler *jobOperationHandler) jobsGetStatus(c echo.Context) error {
 	jobId := c.Param("jobid")
 
-	status := handler.jobScheduler.GetRunningJob(jobId)
+	status := handler.api.Operations.GetRunningJob(scheduler.JobId(jobId))
 	if status == nil {
 		return c.JSON(http.StatusOK, []*jobs.JobStatus{})
 	}

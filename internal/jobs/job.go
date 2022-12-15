@@ -17,11 +17,8 @@ package jobs
 import (
 	"fmt"
 	"github.com/bamzi/jobrunner"
-	"os"
 	"sync"
 	"time"
-
-	"github.com/mimiro-io/datahub/internal/server"
 )
 
 type job struct {
@@ -50,7 +47,8 @@ type jobResult struct {
 // next run, if a full job doesn't get one, we assume it is waiting for an incr job to finnish, so it gets postponed for
 // 5s
 func (job *job) Run() {
-	ticket := job.runner.raffle.borrowTicket(job)
+	return
+	/*ticket := job.runner.raffle.borrowTicket(job)
 	if ticket == nil {
 		if job.pipeline.isFullSync() { // reschedule to try again in a bit
 			duration := 5 * time.Second
@@ -150,7 +148,7 @@ func (job *job) Run() {
 		lastRun.LastError = err.Error()
 	}
 	// its not really a problem to ignore this error
-	_ = job.runner.store.StoreObject(server.JOB_RESULT_INDEX, job.id, lastRun)
+	_ = job.runner.store.StoreObject(server.JOB_RESULT_INDEX, job.id, lastRun)*/
 }
 
 var retryJobIds sync.Map

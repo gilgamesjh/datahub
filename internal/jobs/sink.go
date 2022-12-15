@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mimiro-io/datahub/internal/security"
 	"io/ioutil"
 	"net/http"
 	"strings"
@@ -36,10 +37,15 @@ import (
 // Sink interface for where data can be pushed
 type Sink interface {
 	GetConfig() map[string]interface{}
-	processEntities(runner *Runner, entities []*server.Entity) error
-	startFullSync(runner *Runner) error
-	endFullSync(runner *Runner) error
+	processEntities(eventBus server.EventBus, entities []*server.Entity) error
+	startFullSync() error
+	endFullSync() error
 }
+
+var _ Sink = (*consoleSink)(nil)
+var _ Sink = (*devNullSink)(nil)
+var _ Sink = (*httpDatasetSink)(nil)
+var _ Sink = (*datasetSink)(nil)
 
 func (s *Scheduler) parseSink(jobConfig *JobConfiguration) (Sink, error) {
 	sinkConfig := jobConfig.Sink
@@ -106,15 +112,15 @@ func (s *Scheduler) parseSink(jobConfig *JobConfiguration) (Sink, error) {
 
 type devNullSink struct{}
 
-func (devNullSink *devNullSink) startFullSync(runner *Runner) error {
+func (devNullSink *devNullSink) startFullSync() error {
 	return nil
 }
 
-func (devNullSink *devNullSink) endFullSync(runner *Runner) error {
+func (devNullSink *devNullSink) endFullSync() error {
 	return nil
 }
 
-func (devNullSink *devNullSink) processEntities(*Runner, []*server.Entity) error {
+func (devNullSink *devNullSink) processEntities(server.EventBus, []*server.Entity) error {
 	return nil
 }
 
@@ -127,24 +133,25 @@ func (devNullSink *devNullSink) GetConfig() map[string]interface{} {
 type consoleSink struct {
 	Prefix   string // prefix for the log entries
 	Detailed bool   // if true, logs all entries
+	logger   *zap.SugaredLogger
 }
 
-func (consoleSink *consoleSink) startFullSync(runner *Runner) error {
+func (consoleSink *consoleSink) startFullSync() error {
 	return nil
 }
 
-func (consoleSink *consoleSink) endFullSync(runner *Runner) error {
+func (consoleSink *consoleSink) endFullSync() error {
 	return nil
 }
 
-func (consoleSink *consoleSink) processEntities(runner *Runner, entities []*server.Entity) error {
+func (consoleSink *consoleSink) processEntities(_ server.EventBus, entities []*server.Entity) error {
 	now := time.Now()
 	if consoleSink.Detailed {
 		for _, e := range entities {
-			runner.logger.Infof("%s - %sProcessing %s entities", now.Format(time.RFC3339), consoleSink.Prefix, e)
+			consoleSink.logger.Infof("%s - %sProcessing %v entities", now.Format(time.RFC3339), consoleSink.Prefix, e)
 		}
 	} else {
-		runner.logger.Infof("%s - %sProcessing %d entities", now.Format(time.RFC3339), consoleSink.Prefix, len(entities))
+		consoleSink.logger.Infof("%s - %sProcessing %d entities", now.Format(time.RFC3339), consoleSink.Prefix, len(entities))
 	}
 	return nil
 }
@@ -163,8 +170,9 @@ type httpDatasetSink struct {
 	User             string // for use in basic auth
 	Password         string // for use in basic auth
 	TokenProvider    string // for use in token auth
-	ExpandNamespaces bool   // used to instruct the sink to expand all namespaces
-	StripPrefixes    bool   // used to instruct the sink to remove prefixes
+	TokenProviders   *security.TokenProviders
+	ExpandNamespaces bool // used to instruct the sink to expand all namespaces
+	StripPrefixes    bool // used to instruct the sink to remove prefixes
 	Store            *server.Store
 	inFullSync       bool
 	fullSyncID       string
@@ -172,7 +180,7 @@ type httpDatasetSink struct {
 	logger           *zap.SugaredLogger
 }
 
-func (httpDatasetSink *httpDatasetSink) startFullSync(runner *Runner) error {
+func (httpDatasetSink *httpDatasetSink) startFullSync() error {
 	httpDatasetSink.isFirstBatch = true
 	id := uuid.New()
 	httpDatasetSink.fullSyncID = "fsid-" + id.String()
@@ -180,7 +188,7 @@ func (httpDatasetSink *httpDatasetSink) startFullSync(runner *Runner) error {
 	return nil
 }
 
-func (httpDatasetSink *httpDatasetSink) endFullSync(runner *Runner) error {
+func (httpDatasetSink *httpDatasetSink) endFullSync() error {
 
 	// send empty batch to server with end
 	timeout := 60 * time.Minute
@@ -191,7 +199,7 @@ func (httpDatasetSink *httpDatasetSink) endFullSync(runner *Runner) error {
 
 	allObjects := make([]interface{}, 1)
 	//TODO: https://mimiro.atlassian.net/browse/MIM-693
-	allObjects[0] = runner.store.GetGlobalContext()
+	allObjects[0] = httpDatasetSink.Store.GetGlobalContext()
 
 	jsonEntities, err := json.Marshal(allObjects)
 	if err != nil {
@@ -209,7 +217,7 @@ func (httpDatasetSink *httpDatasetSink) endFullSync(runner *Runner) error {
 
 	if httpDatasetSink.TokenProvider != "" {
 		// attempt to parse the token provider
-		if provider, ok := runner.tokenProviders.Get(strings.ToLower(httpDatasetSink.TokenProvider)); ok {
+		if provider, ok := httpDatasetSink.TokenProviders.Get(strings.ToLower(httpDatasetSink.TokenProvider)); ok {
 			provider.Authorize(req)
 		}
 	}
@@ -231,7 +239,7 @@ func (httpDatasetSink *httpDatasetSink) endFullSync(runner *Runner) error {
 	return nil
 }
 
-func (httpDatasetSink *httpDatasetSink) processEntities(runner *Runner, entities []*server.Entity) error {
+func (httpDatasetSink *httpDatasetSink) processEntities(_ server.EventBus, entities []*server.Entity) error {
 
 	timeout := 60 * time.Minute
 	client := httpclient.NewClient(httpclient.WithHTTPTimeout(timeout))
@@ -241,7 +249,7 @@ func (httpDatasetSink *httpDatasetSink) processEntities(runner *Runner, entities
 
 	allObjects := make([]interface{}, len(entities)+1)
 	//TODO: https://mimiro.atlassian.net/browse/MIM-693
-	allObjects[0] = runner.store.GetGlobalContext()
+	allObjects[0] = httpDatasetSink.Store.GetGlobalContext()
 	for i := 0; i < len(entities); i++ {
 		allObjects[i+1] = entities[i]
 	}
@@ -272,7 +280,7 @@ func (httpDatasetSink *httpDatasetSink) processEntities(runner *Runner, entities
 	// security
 	if httpDatasetSink.TokenProvider != "" {
 		// attempt to parse the token provider
-		if provider, ok := runner.tokenProviders.Get(strings.ToLower(httpDatasetSink.TokenProvider)); ok {
+		if provider, ok := httpDatasetSink.TokenProviders.Get(strings.ToLower(httpDatasetSink.TokenProvider)); ok {
 			provider.Authorize(req)
 		}
 	}
@@ -305,7 +313,7 @@ type datasetSink struct {
 	DatasetManager *server.DsManager
 }
 
-func (datasetSink *datasetSink) startFullSync(runner *Runner) error {
+func (datasetSink *datasetSink) startFullSync() error {
 	dataset := datasetSink.DatasetManager.GetDataset(datasetSink.DatasetName)
 	if dataset == nil {
 		return fmt.Errorf("dataset does not exist: %v", datasetSink.DatasetName)
@@ -313,7 +321,7 @@ func (datasetSink *datasetSink) startFullSync(runner *Runner) error {
 	return dataset.StartFullSync()
 }
 
-func (datasetSink *datasetSink) endFullSync(runner *Runner) error {
+func (datasetSink *datasetSink) endFullSync() error {
 	dataset := datasetSink.DatasetManager.GetDataset(datasetSink.DatasetName)
 	if dataset == nil {
 		return fmt.Errorf("dataset does not exist: %v", datasetSink.DatasetName)
@@ -321,7 +329,7 @@ func (datasetSink *datasetSink) endFullSync(runner *Runner) error {
 	return dataset.CompleteFullSync()
 }
 
-func (datasetSink *datasetSink) processEntities(runner *Runner, entities []*server.Entity) error {
+func (datasetSink *datasetSink) processEntities(eventBus server.EventBus, entities []*server.Entity) error {
 	exists := datasetSink.DatasetManager.IsDataset(datasetSink.DatasetName)
 	if !exists {
 		return fmt.Errorf("dataset does not exist: %v", datasetSink.DatasetName)
@@ -334,8 +342,8 @@ func (datasetSink *datasetSink) processEntities(runner *Runner, entities []*serv
 	if err == nil {
 		// we emit the event so event handlers can react to it
 		ctx := context.Background()
-		runner.eventBus.Emit(ctx, "dataset."+datasetSink.DatasetName, nil)
-		runner.eventBus.Emit(ctx, "dataset.core.Dataset", nil) // something has changed, should trigger this always
+		eventBus.Emit(ctx, "dataset."+datasetSink.DatasetName, nil)
+		eventBus.Emit(ctx, "dataset.core.Dataset", nil) // something has changed, should trigger this always
 	}
 
 	return err

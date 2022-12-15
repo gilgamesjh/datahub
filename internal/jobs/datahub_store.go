@@ -22,18 +22,18 @@ func NewDataHubJobStore(store *server.Store, logger *zap.SugaredLogger) schedule
 	}
 }
 
-func (store *DataHubJobStore) GetConfiguration(id string) (*scheduler.JobConfiguration, error) {
+func (store *DataHubJobStore) GetConfiguration(id scheduler.JobId) (*scheduler.JobConfiguration, error) {
 	jobConfig := &scheduler.JobConfiguration{}
-	err := store.store.GetObject(server.SCHEDULER_JOB_CONFIG_INDEX, id, jobConfig)
+	err := store.store.GetObject(server.SCHEDULER_JOB_CONFIG_INDEX, string(id), jobConfig)
 	return jobConfig, err
 }
 
-func (store *DataHubJobStore) SaveConfiguration(id string, config *scheduler.JobConfiguration) error {
-	return store.store.StoreObject(server.SCHEDULER_JOB_CONFIG_INDEX, id, config)
+func (store *DataHubJobStore) SaveConfiguration(id scheduler.JobId, config *scheduler.JobConfiguration) error {
+	return store.store.StoreObject(server.SCHEDULER_JOB_CONFIG_INDEX, string(id), config)
 }
 
-func (store *DataHubJobStore) DeleteConfiguration(id string) error {
-	return store.store.DeleteObject(server.SCHEDULER_JOB_CONFIG_INDEX, id)
+func (store *DataHubJobStore) DeleteConfiguration(id scheduler.JobId) error {
+	return store.store.DeleteObject(server.SCHEDULER_JOB_CONFIG_INDEX, string(id))
 }
 
 func (store *DataHubJobStore) ListConfigurations() ([]*scheduler.JobConfiguration, error) {

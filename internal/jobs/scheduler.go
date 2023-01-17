@@ -25,18 +25,15 @@ import (
 	"github.com/mimiro-io/internal-go-util/pkg/scheduler"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/mimiro-io/datahub/internal/jobs/source"
 
+	"github.com/mimiro-io/datahub/internal/conf"
+	"github.com/mimiro-io/datahub/internal/server"
 	"github.com/robfig/cron/v3"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
-	"golang.org/x/sync/errgroup"
-
-	"github.com/mimiro-io/datahub/internal/conf"
-	"github.com/mimiro-io/datahub/internal/server"
 )
 
 // The Scheduler deals with reading and writing jobs and making sure they get added to the
@@ -45,7 +42,6 @@ import (
 type Scheduler struct {
 	Logger         *zap.SugaredLogger
 	Store          *server.Store
-	Runner         *Runner
 	DatasetManager *server.DsManager
 
 	runnerV2 *scheduler.JobRunner
@@ -101,9 +97,9 @@ type SchedulerParams struct {
 
 	Store          *server.Store
 	Dsm            *server.DsManager
-	Runner         *Runner
 	TokenProviders *security.TokenProviders
 	JobStore       scheduler.Store
+	SyncState      SyncState
 	Statsd         statsd.ClientInterface
 	EventBus       server.EventBus
 }
@@ -122,7 +118,6 @@ func NewScheduler(lc fx.Lifecycle, env *conf.Env, p SchedulerParams, runnerV2 *s
 	s := &Scheduler{
 		Logger:         env.Logger.Named("scheduler"),
 		Store:          p.Store,
-		Runner:         p.Runner,
 		DatasetManager: p.Dsm,
 		storeV2:        p.JobStore,
 		api:            api,
@@ -133,10 +128,23 @@ func NewScheduler(lc fx.Lifecycle, env *conf.Env, p SchedulerParams, runnerV2 *s
 			s.Logger.Infof("Starting the JobScheduler")
 
 			s.runnerV2 = runnerV2
-			for _, j := range s.loadConfigurations() {
-				err := s.AddJob(j)
+
+			loadedJobs := make(map[string]struct{})
+			configs, _ := p.JobStore.ListConfigurations()
+			for _, j := range configs {
+				err := api.UpdateJob(j)
 				if err != nil {
 					s.Logger.Warnf("Error loading job with id %s (%s), err: %v", j.Id, j.Title, err)
+				}
+				loadedJobs[string(j.Id)] = struct{}{}
+			}
+
+			for _, j := range s.loadConfigurations() {
+				if _, ok := loadedJobs[j.Id]; !ok { // only upgrade job if not loaded already
+					err := s.AddJob(j)
+					if err != nil {
+						s.Logger.Warnf("Error loading job with id %s (%s), err: %v", j.Id, j.Title, err)
+					}
 				}
 			}
 
@@ -144,7 +152,7 @@ func NewScheduler(lc fx.Lifecycle, env *conf.Env, p SchedulerParams, runnerV2 *s
 		},
 		OnStop: func(ctx context.Context) error {
 			s.Logger.Infof("Stopping job runner")
-			s.Runner.Stop()
+			// TODO: Add stop method to new runner
 			return nil
 		},
 	})
@@ -163,13 +171,14 @@ func (s *Scheduler) toV2(jobConfig *JobConfiguration, jobs []*job) error {
 	if runnableJob == nil {
 		return nil
 	}
+
 	configV2 := &scheduler.JobConfiguration{
 		Id:              scheduler.JobId(jobConfig.Id),
 		Title:           jobConfig.Title,
 		Version:         scheduler.JobConfigurationVersion1,
 		Description:     jobConfig.Description,
 		Tags:            jobConfig.Tags,
-		Paused:          jobConfig.Paused,
+		Enabled:         !jobConfig.Paused,
 		BatchSize:       jobConfig.BatchSize,
 		ResumeOnRestart: true, // always resume failed tasks as this is the expected behaviour for now
 		OnError:         []string{"SuccessReport"},
@@ -184,6 +193,7 @@ func (s *Scheduler) toV2(jobConfig *JobConfiguration, jobs []*job) error {
 				Source:      jobConfig.Source,
 				Sink:        jobConfig.Sink,
 				Transform:   jobConfig.Transform,
+				Type:        jobConfig.Triggers[0].JobType,
 				DependsOn:   nil,
 			},
 		},
@@ -211,13 +221,15 @@ func (s *Scheduler) toV2(jobConfig *JobConfiguration, jobs []*job) error {
 // It is important that jobs are valid, so care is taken to validate the JobConfiguration before
 // it can be scheduled.
 func (s *Scheduler) AddJob(jobConfig *JobConfiguration) error {
+	// TODO: redo this as a pure upgrade function
 	err := s.verify(jobConfig)
 	if err != nil {
 		return err
 	}
+	return nil
 
 	// this also verifies that it can be parsed, so do this first
-	triggeredJobs, err := s.toTriggeredJobs(jobConfig)
+	/*triggeredJobs, err := s.toTriggeredJobs(jobConfig)
 	if err != nil {
 		return err
 	}
@@ -227,8 +239,8 @@ func (s *Scheduler) AddJob(jobConfig *JobConfiguration) error {
 		return err
 	}
 
-	err = s.toV2(jobConfig, triggeredJobs)
-	if err != nil {
+	return s.toV2(jobConfig, triggeredJobs)
+	/*if err != nil {
 		return err
 	}
 
@@ -253,7 +265,7 @@ func (s *Scheduler) AddJob(jobConfig *JobConfiguration) error {
 		return nil
 	})
 
-	return g.Wait()
+	return g.Wait()*/
 }
 
 // extractJobs extracts the jobs configured in the JobConfiguration and extracts them as a
@@ -273,7 +285,6 @@ func (s *Scheduler) toTriggeredJobs(jobConfig *JobConfiguration) ([]*job, error)
 				pipeline: pipeline,
 				topic:    t.MonitoredDataset,
 				isEvent:  true,
-				runner:   s.Runner,
 			})
 		case TriggerTypeCron:
 			result = append(result, &job{
@@ -281,31 +292,12 @@ func (s *Scheduler) toTriggeredJobs(jobConfig *JobConfiguration) ([]*job, error)
 				title:    jobConfig.Title,
 				pipeline: pipeline,
 				schedule: t.Schedule,
-				runner:   s.Runner,
 			})
 		default:
 			return nil, errors.New(fmt.Sprintf("could not map trigger configuration to job: %v", t))
 		}
 	}
 	return result, nil
-}
-
-// DeleteJob deletes a JobConfiguration, and calls out to the Runner to make sure it also gets removed from
-// the running jobs.
-// It will attempt to load the job before it deletes it, to validate it's existence.
-func (s *Scheduler) DeleteJob(jobId string) error {
-	jobConfig, err := s.LoadJob(jobId)
-	if err != nil {
-		return err
-	}
-	err = s.Runner.deleteJob(jobConfig.Id)
-	if err != nil {
-		return err
-	}
-
-	err = s.runnerV2.RemoveJob(scheduler.JobId(jobId))
-
-	return nil
 }
 
 // LoadJob will attempt to load a JobConfiguration based on a jobId. Because of the GetObject method currently
@@ -332,113 +324,6 @@ func (s *Scheduler) Parse(rawJson []byte) (*JobConfiguration, error) {
 		return nil, err
 	}
 	return config, nil
-}
-
-// PauseJob pauses a job. It will not stop a running job, but it will prevent the
-// job from running on the next schedule.
-func (s *Scheduler) PauseJob(jobid string) error {
-	jobTitle := s.resolveJobTitle(jobid)
-	s.Logger.Infof("Pausing job with id %s (%s)", jobid, jobTitle)
-	return s.changeStatus(jobid, true)
-}
-
-// UnpauseJob resumes a paused job. It will not run a job, however it will add it to
-// the scheduler so that it can be ran on next schedule.
-func (s *Scheduler) UnpauseJob(jobid string) error {
-	jobTitle := s.resolveJobTitle(jobid)
-	s.Logger.Infof("Un-pausing job with id %s (%s)", jobid, jobTitle)
-	return s.changeStatus(jobid, false)
-}
-
-// KillJob will stop a job stat is currently running. If the job is not running, it will do
-// nothing. If the job that is running is RunOnce, then it will be deleted afterwards.
-func (s *Scheduler) KillJob(jobid string) {
-	jobTitle := s.resolveJobTitle(jobid)
-	s.Logger.Infof("Attempting to stop job with id %s (%s)", jobid, jobTitle)
-	s.runnerV2.CancelJob(scheduler.JobId(jobid))
-	s.Runner.killJob(jobid)
-}
-
-// ResetJob will reset the job since token. This allows the job to be rerun from the beginning
-func (s *Scheduler) ResetJob(jobid string, since string) error {
-	jobTitle := s.resolveJobTitle(jobid)
-	s.Logger.Infof("Resetting since token for job with id '%s' (%s)", jobid, jobTitle)
-
-	syncJobState := &SyncJobState{}
-	err := s.Store.GetObject(server.JOB_DATA_INDEX, jobid, syncJobState)
-	if err != nil {
-		return err
-	}
-
-	if syncJobState.ID == "" {
-		return nil
-	}
-
-	syncJobState.ContinuationToken = since
-	err = s.Store.StoreObject(server.JOB_DATA_INDEX, jobid, syncJobState)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// RunJob runs an existing job, if not already running. It does so by adding a temp job to the scheduler, without saving it.
-// The temp job is added with the RunOnce flag set to true
-func (s *Scheduler) RunJob(jobid string, jobType string) (string, error) {
-	jobConfig, err := s.LoadJob(jobid)
-	s.Logger.Infof("Running job with id '%s' (%s)", jobid, jobConfig.Title)
-
-	if jobConfig == nil || jobConfig.Id == "" { // not found
-		return "", errors.New("could not load job with id " + jobid)
-	}
-
-	if err != nil {
-		return "", err
-	}
-
-	pipeline, err := s.toPipeline(jobConfig, jobType) // this also verifies that it can be parsed, so do this first
-	if err != nil {
-		return "", err
-	}
-
-	jobSpec := &job{
-		id:       jobConfig.Id,
-		title:    jobConfig.Title,
-		pipeline: pipeline,
-		runner:   s.Runner,
-	}
-	jobs := make([]*job, 1)
-	jobs[0] = jobSpec
-
-	err = s.api.Operations.Run(scheduler.JobId(jobid))
-	if err != nil {
-		return "", err
-	}
-
-	/*
-
-		// is the job running?
-		running := s.Runner.raffle.runningJob(jobConfig.Id)
-		if running != nil {
-			return "", errors.New(fmt.Sprintf("job with id '%s' (%s) already running", jobid, jobConfig.Title))
-		}
-
-		// start the job run
-		s.Runner.startJob(job)*/
-
-	return jobConfig.Id, nil
-}
-
-// changeStatus is the internal function to change status from/to paused/un-paused
-func (s *Scheduler) changeStatus(jobid string, pause bool) error {
-	jobConfig, err := s.LoadJob(jobid)
-	if err != nil {
-		return err
-	}
-	// just change the Paused flag, and add the job to the schedule.
-	jobConfig.Paused = pause
-	return s.AddJob(jobConfig)
 }
 
 // loadConfigurations is the internal method to load JobConfiguration's from the store, it is currently different
@@ -555,7 +440,6 @@ func (s *Scheduler) parseSource(jobConfig *JobConfiguration) (source.Source, err
 			if sourceTypeName == "HttpDatasetSource" {
 				src := &source.HttpDatasetSource{}
 				src.Store = s.Store
-				src.Logger = s.Runner.logger.Named("HttpDatasetSource")
 				endpoint, ok := sourceConfig["Url"]
 				if ok && endpoint != "" {
 					src.Endpoint = endpoint.(string)
@@ -566,9 +450,9 @@ func (s *Scheduler) parseSource(jobConfig *JobConfiguration) (source.Source, err
 					// security
 					if tokenProviderName != "" {
 						// attempt to parse the token provider
-						if provider, ok := s.Runner.tokenProviders.Get(strings.ToLower(tokenProviderName)); ok {
-							src.TokenProvider = provider
-						}
+						//if provider, ok := s.Runner.tokenProviders.Get(strings.ToLower(tokenProviderName)); ok {
+						//	src.TokenProvider = provider
+						//}
 					}
 				}
 				return src, nil
@@ -579,11 +463,11 @@ func (s *Scheduler) parseSource(jobConfig *JobConfiguration) (source.Source, err
 				src.DatasetManager = s.DatasetManager
 				src.DatasetName = (sourceConfig["Name"]).(string)
 				src.AuthorizeProxyRequest = func(authProviderName string) func(req *http.Request) {
-					if s.Runner.tokenProviders != nil {
+					/*if s.Runner.tokenProviders != nil {
 						if provider, ok := s.Runner.tokenProviders.Get(strings.ToLower(authProviderName)); ok {
 							return provider.Authorize
 						}
-					}
+					}*/
 					// if no authProvider is found, fall back to no auth for backend requests
 					return func(req *http.Request) {
 						//noop

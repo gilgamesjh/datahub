@@ -1243,6 +1243,26 @@ func (s *Store) GetObject(collection CollectionIndex, id string, obj interface{}
 	return nil
 }
 
+// GetObject is a Generic implementation of the store GetObject func. The difference is that this implementation
+// can properly handle returning nil when not found, as opposed to the other who tries (and fails) to handle nil
+// by zeroing out the value. That returns a nilled out (empty) struct, while this version returns nil correctly.
+func GetObject[T any](s *Store, collection CollectionIndex, id string) (*T, error) {
+	indexBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(indexBytes, uint16(collection))
+	key := append(indexBytes, []byte("::"+id)...)
+	data := s.readValue(key)
+	if data == nil || len(data) == 0 {
+		return nil, nil
+	}
+
+	var t T
+	err := json.Unmarshal(data, &t)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
 // DeleteObject is a slightly less to the metal variation of the deleteValue
 // method. You should probably use this instead of deleteValue if you need
 // to delete stuff. It takes a collection and an object id, and attempts to

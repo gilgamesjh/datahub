@@ -15,9 +15,15 @@
 package jobs
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/DataDog/datadog-go/v5/statsd"
 	"github.com/franela/goblin"
+	"github.com/mimiro-io/datahub/internal/conf"
+	"github.com/mimiro-io/datahub/internal/security"
+	"github.com/mimiro-io/internal-go-util/pkg/scheduler"
+	"go.uber.org/zap"
 	"math"
 	"os"
 	"strings"
@@ -31,10 +37,12 @@ func TestPipelineHistory(t *testing.T) {
 	g.Describe("A pipeline", func() {
 		testCnt := 0
 		var dsm *server.DsManager
-		var scheduler *Scheduler
+		//var scheduler *Scheduler
 		var store *server.Store
 		var runner *Runner
 		var storeLocation string
+
+		var builder *pipelineBuilder
 		g.BeforeEach(func() {
 			// temp redirect of stdout and stderr to swallow some annoying init messages in fx and jobrunner and mockService
 			devNull, _ := os.Open("/dev/null")
@@ -48,8 +56,21 @@ func TestPipelineHistory(t *testing.T) {
 			err := os.RemoveAll(storeLocation)
 			g.Assert(err).IsNil("should be allowed to clean testfiles in " + storeLocation)
 
-			scheduler, store, runner, dsm, _ = setupScheduler(storeLocation, t)
-
+			_, store, runner, dsm, _ = setupScheduler(storeLocation, t)
+			builder = newPipelineBuilder(&conf.Env{
+				Logger: zap.NewNop().Sugar(),
+			}, SchedulerParams{
+				Store:    store,
+				Dsm:      dsm,
+				Runner:   runner,
+				Statsd:   &statsd.NoOpClient{},
+				EventBus: server.NoOpBus(),
+				TokenProviders: &security.TokenProviders{
+					Providers: &map[string]security.Provider{
+						"local": security.BasicProvider{User: "u100", Password: "p200"},
+					},
+				},
+			})
 			// undo redirect of stdout and stderr after successful init of fx and jobrunner
 			os.Stderr = oldErr
 			os.Stdout = oldStd
@@ -62,7 +83,7 @@ func TestPipelineHistory(t *testing.T) {
 		})
 		g.It("Should produce consistent output for single change", func() {
 			ns, employees, people, companies := setupDatasets(store, dsm)
-			job := setupJob(scheduler, g, runner, false)
+			pipeline := setupJob(builder, g, false)
 			homer, _, mimiro := entityUpdaters(people, ns, companies)
 			checkChange, checkEntities, assertChangeCount, _ := setupCheckers(g, t, employees, people, companies, ns)
 			//	homer, homerWithFriend, mimiro := entityUpdaters(people, ns, companies)
@@ -73,8 +94,8 @@ func TestPipelineHistory(t *testing.T) {
 			g.Assert(mimiro("Mimiro_1")).IsNil()
 
 			// run job twice, output should not change
-			job.Run()
-			job.Run()
+			_ = pipeline.sync(context.Background())
+			_ = pipeline.sync(context.Background())
 
 			checkEntities("homer_1", "Mimiro_1", "")
 			checkChange(0, "homer_1", "Mimiro_1", "")
@@ -83,7 +104,7 @@ func TestPipelineHistory(t *testing.T) {
 		})
 		g.It("Should produce consistent output for changes in dependency dataset", func() {
 			ns, employees, people, companies := setupDatasets(store, dsm)
-			job := setupJob(scheduler, g, runner, false)
+			pipeline := setupJob(builder, g, false)
 			homer, _, mimiro := entityUpdaters(people, ns, companies)
 			checkChange, checkEntities, assertChangeCount, _ := setupCheckers(g, t, employees, people, companies, ns)
 			//checkChange, checkEntities, assertChangeCount, printState := setupCheckers(g, t, employees, people, companies, ns)
@@ -95,7 +116,7 @@ func TestPipelineHistory(t *testing.T) {
 
 			// run job many times, output should not change
 			for i := 0; i < 10; i++ {
-				job.Run()
+				_ = pipeline.sync(context.Background())
 			}
 			//printState()
 			checkEntities("homer_1", "Mimiro_2", "")
@@ -104,7 +125,7 @@ func TestPipelineHistory(t *testing.T) {
 		})
 		g.It("Should produce consistent output for changes in source dataset", func() {
 			ns, employees, people, companies := setupDatasets(store, dsm)
-			job := setupJob(scheduler, g, runner, false)
+			pipeline := setupJob(builder, g, false)
 			homer, _, mimiro := entityUpdaters(people, ns, companies)
 			//checkChange, checkEntities, assertChangeCount, _ := setupCheckers(g, t, employees, people, companies, ns)
 			checkChange, checkEntities, assertChangeCount, printState := setupCheckers(g, t, employees, people, companies, ns)
@@ -116,7 +137,7 @@ func TestPipelineHistory(t *testing.T) {
 
 			// run job many times, output should not change
 			for i := 0; i < 5; i++ {
-				job.Run()
+				_ = pipeline.sync(context.Background())
 			}
 			printState()
 			checkEntities("homer_2", "Mimiro_1", "")
@@ -128,7 +149,7 @@ func TestPipelineHistory(t *testing.T) {
 		})
 		g.It("Should produce consistent output for LastOnly changes in source dataset", func() {
 			ns, employees, people, companies := setupDatasets(store, dsm)
-			job := setupJob(scheduler, g, runner, true)
+			pipeline := setupJob(builder, g, true)
 			homer, _, mimiro := entityUpdaters(people, ns, companies)
 			//checkChange, checkEntities, assertChangeCount, _ := setupCheckers(g, t, employees, people, companies, ns)
 			checkChange, checkEntities, assertChangeCount, printState := setupCheckers(g, t, employees, people, companies, ns)
@@ -140,7 +161,7 @@ func TestPipelineHistory(t *testing.T) {
 
 			// run job many times, output should not change
 			for i := 0; i < 5; i++ {
-				job.Run()
+				_ = pipeline.sync(context.Background())
 			}
 			printState()
 			checkEntities("homer_2", "Mimiro_1", "")
@@ -149,9 +170,9 @@ func TestPipelineHistory(t *testing.T) {
 		})
 		g.It("Should produce consistent output for 2 changes in different batches", func() {
 			ns, employees, people, companies := setupDatasets(store, dsm)
-			job := setupJob(scheduler, g, runner, false)
+			pipeline := setupJob(builder, g, false)
 			// set batchsize to 2
-			job.pipeline.(*FullSyncPipeline).batchSize = 2
+			pipeline.(*FullSyncPipeline).batchSize = 2
 			homer, _, mimiro := entityUpdaters(people, ns, companies)
 			checkChange, checkEntities, assertChangeCount, print := setupCheckers(g, t, employees, people, companies, ns)
 			//	homer, homerWithFriend, mimiro := entityUpdaters(people, ns, companies)
@@ -164,7 +185,7 @@ func TestPipelineHistory(t *testing.T) {
 
 			// run job many times, output should not change
 			for i := 0; i < 5; i++ {
-				job.Run()
+				_ = pipeline.sync(context.Background())
 			}
 			print()
 			checkEntities("homer_3", "Mimiro_2", "")
@@ -179,9 +200,9 @@ func TestPipelineHistory(t *testing.T) {
 		})
 		g.It("Should produce consistent output for 2 LastOnly changes in different batches", func() {
 			ns, employees, people, companies := setupDatasets(store, dsm)
-			job := setupJob(scheduler, g, runner, true)
+			pipeline := setupJob(builder, g, true)
 			// set batchsize to 2
-			job.pipeline.(*FullSyncPipeline).batchSize = 2
+			pipeline.(*FullSyncPipeline).batchSize = 2
 			homer, _, mimiro := entityUpdaters(people, ns, companies)
 			checkChange, checkEntities, assertChangeCount, print := setupCheckers(g, t, employees, people, companies, ns)
 			//	homer, homerWithFriend, mimiro := entityUpdaters(people, ns, companies)
@@ -194,7 +215,7 @@ func TestPipelineHistory(t *testing.T) {
 
 			// run job many times, output should not change
 			for i := 0; i < 5; i++ {
-				job.Run()
+				_ = pipeline.sync(context.Background())
 			}
 			print()
 			checkEntities("homer_3", "Mimiro_2", "")
@@ -214,7 +235,7 @@ func TestPipelineHistory(t *testing.T) {
 				of the joined "employee" entity if we run the transform again.
 			*/
 			ns, employees, people, companies := setupDatasets(store, dsm)
-			job := setupJob(scheduler, g, runner, false)
+			pipeline := setupJob(builder, g, false)
 			homer, homerWithFriend, mimiro := entityUpdaters(people, ns, companies)
 			checkChange, checkEntities, assertChangeCount, print := setupCheckers(g, t, employees, people, companies, ns)
 
@@ -224,7 +245,7 @@ func TestPipelineHistory(t *testing.T) {
 			g.Assert(mimiro("Mimiro_1")).IsNil()
 
 			// now, first run with baseline
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			checkEntities("homer_1", "Mimiro_1", "")
 			assertChangeCount(1)
@@ -232,7 +253,7 @@ func TestPipelineHistory(t *testing.T) {
 
 			///////////// first change: homer new name, add friend /////////////////
 			g.Assert(homerWithFriend("homer_2")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			checkEntities("homer_2", "Mimiro_1", "barney")
 			assertChangeCount(2)
@@ -241,22 +262,22 @@ func TestPipelineHistory(t *testing.T) {
 
 			//////////// 2nd change: Mimiro new name //////////////////
 			g.Assert(mimiro("Mimiro_2")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 			/////////// 3rd change: homer new name again, rm friend
 			g.Assert(homer("homer_3")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 			/////////// 4th change: homer back to old name
 			g.Assert(homer("homer_1")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 			/////////// 5th change: Mimiro new name
 			g.Assert(mimiro("Mimiro_3")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 			/////////// 6th change: homer  final change
 			g.Assert(homer("homer_4")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 			/////////// 7th change: mimiro  final change
 			g.Assert(mimiro("Mimiro_4")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			print()
 			checkEntities("homer_4", "Mimiro_4", "")
@@ -269,7 +290,7 @@ func TestPipelineHistory(t *testing.T) {
 		})
 		g.It("Should preserve state of composed LatestOnly change products also if sources change with time", func() {
 			ns, employees, people, companies := setupDatasets(store, dsm)
-			job := setupJob(scheduler, g, runner, true)
+			pipeline := setupJob(builder, g, true)
 			homer, homerWithFriend, mimiro := entityUpdaters(people, ns, companies)
 			checkChange, checkEntities, assertChangeCount, print := setupCheckers(g, t, employees, people, companies, ns)
 
@@ -279,7 +300,7 @@ func TestPipelineHistory(t *testing.T) {
 			g.Assert(mimiro("Mimiro_1")).IsNil()
 
 			// now, first run with baseline
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			checkEntities("homer_1", "Mimiro_1", "")
 			assertChangeCount(1)
@@ -287,7 +308,7 @@ func TestPipelineHistory(t *testing.T) {
 
 			///////////// first change: homer new name, add friend /////////////////
 			g.Assert(homerWithFriend("homer_2")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			checkEntities("homer_2", "Mimiro_1", "barney")
 			assertChangeCount(2)
@@ -296,22 +317,22 @@ func TestPipelineHistory(t *testing.T) {
 
 			//////////// 2nd change: Mimiro new name //////////////////
 			g.Assert(mimiro("Mimiro_2")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 			/////////// 3rd change: homer new name again, rm friend
 			g.Assert(homer("homer_3")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 			/////////// 4th change: homer back to old name
 			g.Assert(homer("homer_1")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 			/////////// 5th change: Mimiro new name
 			g.Assert(mimiro("Mimiro_3")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 			/////////// 6th change: homer  final change
 			g.Assert(homer("homer_4")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 			/////////// 7th change: mimiro  final change
 			g.Assert(mimiro("Mimiro_4")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			print()
 			checkEntities("homer_4", "Mimiro_4", "")
@@ -331,7 +352,7 @@ func TestPipelineHistory(t *testing.T) {
 					transform job once at the end.
 			*/
 			ns, employees, people, companies := setupDatasets(store, dsm)
-			job := setupJob(scheduler, g, runner, false)
+			pipeline := setupJob(builder, g, false)
 			homer, homerWithFriend, mimiro := entityUpdaters(people, ns, companies)
 			checkChange, checkEntities, assertChangeCount, print := setupCheckers(g, t, employees, people, companies, ns)
 
@@ -354,7 +375,7 @@ func TestPipelineHistory(t *testing.T) {
 			g.Assert(homer("homer_4")).IsNil()
 			/////////// 7th change: mimiro  final change
 			g.Assert(mimiro("Mimiro_4")).IsNil()
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			print()
 			checkEntities("homer_4", "Mimiro_4", "")
@@ -465,7 +486,7 @@ func entityUpdaters(people *server.Dataset, ns string, companies *server.Dataset
 	return homer, homerWithFriend, mimiro
 }
 
-func setupJob(scheduler *Scheduler, g *goblin.G, runner *Runner, latestOnly bool) *job {
+func setupJob(builder *pipelineBuilder, g *goblin.G, latestOnly bool) Pipeline {
 	// now combine homer and mimiro into homer-the-employee
 	jsFun := `function transform_entities(entities) {
 			var result = []
@@ -486,24 +507,28 @@ func setupJob(scheduler *Scheduler, g *goblin.G, runner *Runner, latestOnly bool
 		    return result;
 		}`
 	// define job
-	jobConfig, _ := scheduler.Parse([]byte(fmt.Sprintf(`{
-			"id" : "sync-datasetsource-to-datasetsink-with-js-and-query",
-			"triggers": [{"triggerType": "cron", "jobType": "fullSync", "schedule": "@every 2s"}],
-			"source" : { "Type" : "DatasetSource", "Name" : "People", "LatestOnly": "%v" },
-			"transform" : { "Type" : "JavascriptTransform", "Code" : "%v" },
-			"sink" : { "Type" : "DatasetSink", "Name" : "Employees" }}`,
-		latestOnly,
-		base64.StdEncoding.EncodeToString([]byte(jsFun)))))
-
-	pipeline, err := scheduler.toPipeline(jobConfig, JobTypeFull)
-	g.Assert(err).IsNil()
-	job := &job{
-		id:       jobConfig.Id,
-		pipeline: pipeline,
-		schedule: jobConfig.Triggers[0].Schedule,
-		runner:   runner,
+	task := &scheduler.TaskConfiguration{
+		Id: "sync-datasetsource-to-datasetsink-with-js-and-query",
+		Source: map[string]any{
+			"Type":       "DatasetSource",
+			"Name":       "People",
+			"LatestOnly": latestOnly,
+		},
+		Transform: map[string]any{
+			"Type": "JavascriptTransform",
+			"Code": base64.StdEncoding.EncodeToString([]byte(jsFun)),
+		},
+		Sink: map[string]any{
+			"Type": "DatasetSink",
+			"Name": "Employees",
+		},
+		Type: JobTypeFull,
 	}
-	return job
+	pipeline, err := builder.buildV2(task)
+
+	g.Assert(err).IsNil()
+
+	return pipeline
 }
 
 func setupDatasets(store *server.Store, dsm *server.DsManager) (string, *server.Dataset, *server.Dataset, *server.Dataset) {

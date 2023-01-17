@@ -16,7 +16,6 @@ package jobs
 
 import (
 	"encoding/base64"
-	"github.com/DataDog/datadog-go/v5/statsd"
 	"strings"
 	"testing"
 
@@ -46,7 +45,7 @@ func TestTransform(t *testing.T) {
 			entities := make([]*server.Entity, 0)
 			entities = append(entities, server.NewEntity("1", 1))
 
-			_, err = transform.transformEntities(&Runner{statsdClient: &statsd.NoOpClient{}}, entities, "")
+			_, err = transform.transformEntities(entities, "")
 			g.Assert(err).IsNotNil("transform should fail")
 			g.Assert(strings.Split(err.Error(), " (")[0]).
 				Eql("ReferenceError: prefix is not defined at transform_entities")
@@ -64,7 +63,7 @@ func TestTransform(t *testing.T) {
 			entities := make([]*server.Entity, 0)
 			entities = append(entities, server.NewEntity("1", 1))
 
-			_, err = transform.transformEntities(&Runner{statsdClient: &statsd.NoOpClient{}}, entities, "")
+			_, err = transform.transformEntities(entities, "")
 			g.Assert(err).IsNotNil("transform should fail")
 			g.Assert(strings.Split(err.Error(), " (")[0]).
 				Eql("transform emitted invalid entity: hello")

@@ -31,7 +31,7 @@ replace github.com/dop251/goja => github.com/mimiro-io/goja v1.0.0
 
 require (
 	github.com/lucasepe/codename v0.2.0
-	github.com/mimiro-io/internal-go-util v0.0.0-20221209150617-6f4fb1e58c9b
+	github.com/mimiro-io/internal-go-util v0.0.0-20230110154409-202aaa7bb88e
 	github.com/pkg/errors v0.9.1
 )
 

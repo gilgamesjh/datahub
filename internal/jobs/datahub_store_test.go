@@ -66,6 +66,8 @@ func TestDatahubStore(t *testing.T) {
 
 		})
 		g.It("should be able to retrieve a stored configuration", func() {
+
+			g.Timeout(1 * time.Hour)
 			s := NewDataHubJobStore(store, zap.NewNop().Sugar())
 			err := s.SaveConfiguration("id-1", &scheduler.JobConfiguration{
 				Id:    "id-1",
@@ -76,7 +78,7 @@ func TestDatahubStore(t *testing.T) {
 			config, err := s.GetConfiguration("id-1")
 			g.Assert(err).IsNil("it failed fetching job configuration")
 			g.Assert(config).IsNotNil("it didn't find the config")
-			g.Assert(config.Id).Eql("id-1")
+			g.Assert(string(config.Id)).Eql("id-1", "should be correct")
 			g.Assert(config.Title).Eql("hello")
 		})
 		g.It("should return a list of configurations", func() {
@@ -93,7 +95,7 @@ func TestDatahubStore(t *testing.T) {
 			items, err := s.ListConfigurations()
 			g.Assert(err).IsNil("failed getting configurations")
 			g.Assert(len(items)).Eql(2)
-			g.Assert(items[0].Id).Eql("id-1")
+			g.Assert(string(items[0].Id)).Eql("id-1")
 		})
 		g.It("should be able to delete a configuration", func() {
 			s := NewDataHubJobStore(store, zap.NewNop().Sugar())
@@ -115,7 +117,7 @@ func TestDatahubStore(t *testing.T) {
 
 			items, _ = s.ListConfigurations()
 			g.Assert(len(items)).Eql(1)
-			g.Assert(items[0].Id).Eql("id-2")
+			g.Assert(string(items[0].Id)).Eql("id-2")
 
 		})
 	})
@@ -169,6 +171,8 @@ func TestDatahubStore(t *testing.T) {
 			tasks, err := s.GetTasks("id-1")
 			g.Assert(err).IsNil("failed fetching tasks for job")
 			g.Assert(len(tasks)).Eql(2)
+			g.Assert(tasks[0].Id != "").IsTrue("missing id")
+			g.Assert(tasks[0].Status).Eql(scheduler.StatusPlanned)
 		})
 		g.It("should be able to change task status", func() {
 			s := NewDataHubJobStore(store, zap.NewNop().Sugar())

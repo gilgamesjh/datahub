@@ -23,9 +23,7 @@ func NewDataHubJobStore(store *server.Store, logger *zap.SugaredLogger) schedule
 }
 
 func (store *DataHubJobStore) GetConfiguration(id scheduler.JobId) (*scheduler.JobConfiguration, error) {
-	jobConfig := &scheduler.JobConfiguration{}
-	err := store.store.GetObject(server.SCHEDULER_JOB_CONFIG_INDEX, string(id), jobConfig)
-	return jobConfig, err
+	return server.GetObject[scheduler.JobConfiguration](store.store, server.SCHEDULER_JOB_CONFIG_INDEX, string(id))
 }
 
 func (store *DataHubJobStore) SaveConfiguration(id scheduler.JobId, config *scheduler.JobConfiguration) error {
@@ -55,9 +53,8 @@ func (store *DataHubJobStore) ListConfigurations() ([]*scheduler.JobConfiguratio
 
 func (store *DataHubJobStore) GetTaskState(jobId scheduler.JobId, taskId string) (*scheduler.TaskState, error) {
 	id := fmt.Sprintf("%s::%s", jobId, taskId)
-	task := &scheduler.TaskState{}
-	err := store.store.GetObject(server.SCHEDULER_JOB_STATE_INDEX, id, task)
-	return task, err
+
+	return server.GetObject[scheduler.TaskState](store.store, server.SCHEDULER_JOB_STATE_INDEX, id)
 }
 
 func (store *DataHubJobStore) SaveTaskState(jobId scheduler.JobId, state *scheduler.TaskState) error {
@@ -78,11 +75,17 @@ func (store *DataHubJobStore) GetTasks(jobId scheduler.JobId) ([]*scheduler.Task
 			store.logger.Warnf(" > Error parsing job from store - aborting start: %s", err)
 			return err
 		}
-		tasks = append(tasks, task)
+		if task.Id != "" {
+			tasks = append(tasks, task)
+		}
 
 		return nil
 	})
 	return tasks, err
+}
+
+func (store *DataHubJobStore) DeleteTask(jobId scheduler.JobId, taskId string) error {
+	return store.store.DeleteObject(server.SCHEDULER_JOB_STATE_INDEX, fmt.Sprintf("%s::%s", jobId, taskId))
 }
 
 func (store *DataHubJobStore) DeleteTasks(jobId scheduler.JobId) error {

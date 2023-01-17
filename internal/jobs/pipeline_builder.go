@@ -22,6 +22,7 @@ type pipelineBuilder struct {
 	tokenProviders *security.TokenProviders
 	eventBus       server.EventBus
 	statsdClient   statsd.ClientInterface
+	state          SyncState
 }
 
 func newPipelineBuilder(env *conf.Env, p SchedulerParams) *pipelineBuilder {
@@ -29,13 +30,14 @@ func newPipelineBuilder(env *conf.Env, p SchedulerParams) *pipelineBuilder {
 		dsm:            p.Dsm,
 		store:          p.Store,
 		logger:         env.Logger,
+		state:          p.SyncState,
 		tokenProviders: p.TokenProviders,
 		eventBus:       p.EventBus,
 		statsdClient:   p.Statsd,
 	}
 }
 
-func (b *pipelineBuilder) buildV2(task *scheduler.TaskConfiguration) (Pipeline, error) {
+func (b *pipelineBuilder) buildV2(jobId scheduler.JobId, task *scheduler.TaskConfiguration) (Pipeline, error) {
 	sink, err := b.buildSink(task.Sink)
 	if err != nil {
 		return nil, err
@@ -52,12 +54,19 @@ func (b *pipelineBuilder) buildV2(task *scheduler.TaskConfiguration) (Pipeline, 
 	}
 
 	pipeline := PipelineSpec{
+		task: struct {
+			jobId  scheduler.JobId
+			taskId string
+			name   string
+		}{jobId: jobId, taskId: task.Id, name: task.Name},
 		source:       src,
 		sink:         sink,
 		transform:    t,
 		store:        b.store,
+		state:        b.state,
 		batchSize:    defaultBatchSize,
 		statsdClient: b.statsdClient,
+		eventBus:     b.eventBus,
 	}
 	if task.BatchSize != 0 {
 		pipeline.batchSize = task.BatchSize
@@ -72,11 +81,16 @@ func (b *pipelineBuilder) buildV2(task *scheduler.TaskConfiguration) (Pipeline, 
 }
 
 func (b *pipelineBuilder) buildSink(sinkConfig map[string]any) (Sink, error) {
+	// do pass to lower case the keys
+	for k, v := range sinkConfig {
+		sinkConfig[strings.ToLower(k)] = v
+	}
+
 	if sinkConfig != nil {
-		sinkTypeName := sinkConfig["Type"]
+		sinkTypeName := sinkConfig["type"]
 		if sinkTypeName != nil {
 			if sinkTypeName == "DatasetSink" {
-				dsname := (sinkConfig["Name"]).(string)
+				dsname := (sinkConfig["name"]).(string)
 				dataset := b.dsm.GetDataset(dsname)
 				if dataset != nil && dataset.IsProxy() {
 					sink := &httpDatasetSink{}
@@ -86,6 +100,7 @@ func (b *pipelineBuilder) buildSink(sinkConfig map[string]any) (Sink, error) {
 
 					if dataset.ProxyConfig.AuthProviderName != "" {
 						sink.TokenProvider = dataset.ProxyConfig.AuthProviderName
+						sink.TokenProviders = b.tokenProviders
 					}
 					return sink, nil
 				}
@@ -93,17 +108,18 @@ func (b *pipelineBuilder) buildSink(sinkConfig map[string]any) (Sink, error) {
 				sink.DatasetName = dsname
 				sink.Store = b.store
 				sink.DatasetManager = b.dsm
+
 				return sink, nil
 			} else if sinkTypeName == "DevNullSink" {
 				sink := &devNullSink{}
 				return sink, nil
 			} else if sinkTypeName == "ConsoleSink" {
 				sink := &consoleSink{}
-				v, ok := sinkConfig["Prefix"]
+				v, ok := sinkConfig["prefix"]
 				if ok {
 					sink.Prefix = v.(string)
 				}
-				v, ok = sinkConfig["Detailed"]
+				v, ok = sinkConfig["detailed"]
 				if ok {
 					sink.Detailed = v.(bool)
 				}
@@ -116,14 +132,15 @@ func (b *pipelineBuilder) buildSink(sinkConfig map[string]any) (Sink, error) {
 				sink.TokenProviders = b.tokenProviders
 				sink.logger = b.logger.Named("sink")
 
-				endpoint, ok := sinkConfig["Url"]
+				endpoint, ok := sinkConfig["url"]
 				if ok && endpoint != "" {
 					sink.Endpoint = endpoint.(string)
 				}
-				tokenProvider, ok := sinkConfig["TokenProvider"]
+				tokenProvider, ok := sinkConfig["tokenprovider"]
 				if ok {
 					sink.TokenProvider = tokenProvider.(string)
 				}
+				sink.TokenProviders = b.tokenProviders
 				return sink, nil
 			} else {
 				return nil, errors.New("unknown sink type: " + sinkTypeName.(string))
@@ -135,18 +152,23 @@ func (b *pipelineBuilder) buildSink(sinkConfig map[string]any) (Sink, error) {
 }
 
 func (b *pipelineBuilder) buildSource(sourceConfig map[string]any) (source.Source, error) {
+	// do a pass and lowercase the keys
+	for k, v := range sourceConfig {
+		sourceConfig[strings.ToLower(k)] = v
+	}
+
 	if sourceConfig != nil {
-		sourceTypeName := sourceConfig["Type"]
+		sourceTypeName := sourceConfig["type"]
 		if sourceTypeName != nil {
 			if sourceTypeName == "HttpDatasetSource" {
 				src := &source.HttpDatasetSource{}
 				src.Store = b.store
 				src.Logger = b.logger.Named("HttpDatasetSource")
-				endpoint, ok := sourceConfig["Url"]
+				endpoint, ok := sourceConfig["url"]
 				if ok && endpoint != "" {
 					src.Endpoint = endpoint.(string)
 				}
-				tokenProviderRaw, ok := sourceConfig["TokenProvider"]
+				tokenProviderRaw, ok := sourceConfig["tokenprovider"]
 				if ok {
 					tokenProviderName := tokenProviderRaw.(string)
 					// security
@@ -157,13 +179,14 @@ func (b *pipelineBuilder) buildSource(sourceConfig map[string]any) (source.Sourc
 						}
 					}
 				}
+
 				return src, nil
 			} else if sourceTypeName == "DatasetSource" {
 				var err error
 				src := &source.DatasetSource{}
 				src.Store = b.store
 				src.DatasetManager = b.dsm
-				src.DatasetName = (sourceConfig["Name"]).(string)
+				src.DatasetName = (sourceConfig["name"]).(string)
 				src.AuthorizeProxyRequest = func(authProviderName string) func(req *http.Request) {
 					if b.tokenProviders != nil {
 						if provider, ok := b.tokenProviders.Get(strings.ToLower(authProviderName)); ok {
@@ -175,8 +198,8 @@ func (b *pipelineBuilder) buildSource(sourceConfig map[string]any) (source.Sourc
 						//noop
 					}
 				}
-				if sourceConfig["LatestOnly"] != nil {
-					i := sourceConfig["LatestOnly"]
+				if sourceConfig["latestonly"] != nil {
+					i := sourceConfig["latestonly"]
 					if boolVal, ok := i.(bool); ok {
 						src.LatestOnly = boolVal
 					} else {
@@ -191,13 +214,13 @@ func (b *pipelineBuilder) buildSource(sourceConfig map[string]any) (source.Sourc
 				src := &source.MultiSource{}
 				src.Store = b.store
 				src.DatasetManager = b.dsm
-				src.DatasetName = (sourceConfig["Name"]).(string)
-				err := src.ParseDependencies(sourceConfig["Dependencies"])
+				src.DatasetName = (sourceConfig["name"]).(string)
+				err := src.ParseDependencies(sourceConfig["dependencies"])
 				if err != nil {
 					return nil, err
 				}
-				if sourceConfig["LatestOnly"] != nil {
-					i := sourceConfig["LatestOnly"]
+				if sourceConfig["latestonly"] != nil {
+					i := sourceConfig["latestonly"]
 					if boolVal, ok := i.(bool); ok {
 						src.LatestOnly = boolVal
 					} else {
@@ -210,7 +233,7 @@ func (b *pipelineBuilder) buildSource(sourceConfig map[string]any) (source.Sourc
 				return src, nil
 			} else if sourceTypeName == "UnionDatasetSource" {
 				src := &source.UnionDatasetSource{}
-				datasets, ok := sourceConfig["DatasetSources"].([]interface{})
+				datasets, ok := sourceConfig["datasetsources"].([]interface{})
 				if ok {
 					for _, dsSrcConfig := range datasets {
 						if dsSrcConfigMap, ok2 := dsSrcConfig.(map[string]interface{}); ok2 {
@@ -232,15 +255,15 @@ func (b *pipelineBuilder) buildSource(sourceConfig map[string]any) (source.Sourc
 			} else if sourceTypeName == "SampleSource" {
 				src := &source.SampleSource{}
 				src.Store = b.store
-				numEntities := sourceConfig["NumberOfEntities"]
+				numEntities := sourceConfig["numberofentities"]
 				if numEntities != nil {
 					src.NumberOfEntities = int(numEntities.(float64))
 				}
 				return src, nil
 			} else if sourceTypeName == "SlowSource" {
 				src := &source.SlowSource{}
-				src.Sleep = sourceConfig["Sleep"].(string)
-				batch := sourceConfig["BatchSize"]
+				src.Sleep = sourceConfig["sleep"].(string)
+				batch := sourceConfig["batchsize"]
 				if batch != nil {
 					src.BatchSize = int(batch.(float64))
 				}
@@ -255,20 +278,25 @@ func (b *pipelineBuilder) buildSource(sourceConfig map[string]any) (source.Sourc
 }
 
 func (b *pipelineBuilder) buildTransform(transformConfig map[string]any) (Transform, error) {
+	// do a pass to lower case the keys
+	for k, v := range transformConfig {
+		transformConfig[strings.ToLower(k)] = v
+	}
+
 	if transformConfig != nil {
-		transformTypeName := transformConfig["Type"]
+		transformTypeName := transformConfig["type"]
 		if transformTypeName != nil {
 			if transformTypeName == "HttpTransform" {
 				transform := &HttpTransform{}
-				url, ok := transformConfig["Url"]
+				url, ok := transformConfig["url"]
 				if ok && url != "" {
 					transform.Url = url.(string)
 				}
-				tokenProvider, ok := transformConfig["TokenProvider"]
+				tokenProvider, ok := transformConfig["tokenprovider"]
 				if ok {
 					transform.TokenProvider = tokenProvider.(string)
 				}
-				timeout, ok := transformConfig["TimeOut"]
+				timeout, ok := transformConfig["timeout"]
 				if ok && timeout != 0 {
 					transform.TimeOut = timeout.(float64)
 				} else {
@@ -277,13 +305,13 @@ func (b *pipelineBuilder) buildTransform(transformConfig map[string]any) (Transf
 				transform.TokenProviders = b.tokenProviders
 				return transform, nil
 			} else if transformTypeName == "JavascriptTransform" {
-				code64, ok := transformConfig["Code"]
+				code64, ok := transformConfig["code"]
 				if ok && code64 != "" {
 					transform, err := newJavascriptTransform(b.logger, code64.(string), b.store)
 					if err != nil {
 						return nil, err
 					}
-					parallelism, ok := transformConfig["Parallelism"]
+					parallelism, ok := transformConfig["parallelism"]
 					if ok {
 						transform.Parallelism = int(parallelism.(float64))
 						if err != nil {

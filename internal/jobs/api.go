@@ -2,12 +2,17 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/mimiro-io/datahub/internal/conf"
 	"github.com/mimiro-io/datahub/internal/server"
 	"github.com/mimiro-io/internal-go-util/pkg/scheduler"
 	"go.uber.org/zap"
 	"time"
+)
+
+var (
+	ErrJobNotFound = errors.New("job configuration not found")
 )
 
 type Api struct {
@@ -22,6 +27,7 @@ func NewApi(env *conf.Env, p SchedulerParams, runnerV2 *scheduler.JobRunner) *Ap
 	ops := &operations{
 		store:  p.JobStore,
 		runner: runnerV2,
+		state:  p.SyncState,
 		ds:     p.Store,
 		logger: env.Logger.Named("jobs"),
 	}
@@ -35,6 +41,7 @@ func NewApi(env *conf.Env, p SchedulerParams, runnerV2 *scheduler.JobRunner) *Ap
 
 type operations struct {
 	store  scheduler.Store
+	state  SyncState
 	ds     *server.Store
 	runner *scheduler.JobRunner
 	logger *zap.SugaredLogger
@@ -48,8 +55,17 @@ func (api *Api) UpdateJob(jobConfiguration *scheduler.JobConfiguration) error {
 	}
 
 	// if state is missing, add to scheduler
-	state := api.runner.RunningState(jobConfiguration.Id)
-	if state == nil {
+	state, err := api.runner.RunningState(jobConfiguration.Id)
+	if err != nil {
+		return err
+	}
+	if state == nil || (state != nil && len(jobConfiguration.Tasks) != len(state.Tasks)) {
+		if state != nil && len(jobConfiguration.Tasks) != len(state.Tasks) { // job tasks has been changed, need to reload
+			err := api.runner.RemoveJob(jobConfiguration.Id, false)
+			if err != nil {
+				return err
+			}
+		}
 		jobConfiguration.DefaultFunc = func(ctx context.Context, task *scheduler.JobTask) error {
 			return nil
 		}
@@ -65,12 +81,12 @@ func (api *Api) UpdateJob(jobConfiguration *scheduler.JobConfiguration) error {
 		}
 
 		for _, t := range v2job.Tasks {
-			pipeline, err := api.builder.buildV2(lookup[t.Id])
+			pipeline, err := api.builder.buildV2(v2job.Id, lookup[t.Id])
 			if err != nil {
 				return err
 			}
 			t.Fn = func(ctx context.Context, task *scheduler.JobTask) error {
-				return pipeline.sync(t, ctx)
+				return pipeline.sync(ctx)
 			}
 		}
 
@@ -78,6 +94,9 @@ func (api *Api) UpdateJob(jobConfiguration *scheduler.JobConfiguration) error {
 		if err != nil {
 			return err
 		}
+		//
+	} else {
+		return api.runner.ForceReload(jobConfiguration.Id)
 	}
 	return nil
 }
@@ -87,7 +106,7 @@ func (api *Api) GetJob(jobId scheduler.JobId) (*scheduler.JobConfiguration, erro
 }
 
 func (api *Api) DeleteJob(jobId scheduler.JobId) error {
-	return api.runner.RemoveJob(jobId)
+	return api.runner.RemoveJob(jobId, true)
 }
 
 func (api *Api) ListJobs() ([]*scheduler.JobConfiguration, error) {
@@ -96,31 +115,37 @@ func (api *Api) ListJobs() ([]*scheduler.JobConfiguration, error) {
 
 // GetScheduleEntries returns a cron list of all scheduled entries currently scheduled.
 // Paused jobs are not part of this list
-func (api *Api) GetScheduleEntries() ScheduleEntries {
+func (api *Api) GetScheduleEntries() (*ScheduleEntries, error) {
 	se := make([]ScheduleEntry, 0)
 
-	for _, e := range api.runner.Schedules() {
+	schedules, err := api.runner.Schedules()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, e := range schedules {
 		se = append(se, ScheduleEntry{
 			Id:       int(e.EntryID),
 			JobId:    string(e.Job.Id),
 			JobTitle: e.Job.Title,
 			Next:     e.Next,
 			Prev:     e.Prev,
-			Enabled:  !e.Job.Paused,
+			Enabled:  e.Job.Enabled,
 		})
 	}
 
-	entries := ScheduleEntries{
+	entries := &ScheduleEntries{
 		Entries: se,
 	}
 
-	return entries
+	return entries, nil
 }
 
 type JobStatus struct {
 	JobId    string    `json:"jobId"`
 	JobTitle string    `json:"jobTitle"`
 	Started  time.Time `json:"started"`
+	Status   string    `json:"status"`
 }
 
 // GetRunningJobs gets the status for all running jobs. It can be used to see
@@ -141,29 +166,23 @@ func (api *Api) GetRunningJobs() []JobStatus {
 	return jobs*/
 }
 
+func (api *Api) ListJobStatus() ([]scheduler.JobEntry, error) {
+	return api.runner.JobEntries()
+}
+
 // GetRunningJob gets the status for a single running job. This can be used
 // to see if a job is still running, and is currently used by the cli to follow
 // a job run operation.
-func (o *operations) GetRunningJob(jobId scheduler.JobId) *JobStatus {
-	runningJob := o.runner.RunningState(jobId)
-	if runningJob == nil {
-		return nil
-	}
-	if runningJob.State != scheduler.WorkerStateRunning {
-		return nil
-	}
-	return &JobStatus{
-		JobId:    string(jobId),
-		JobTitle: runningJob.JobTitle,
-		Started:  runningJob.Started,
-	}
-
+func (o *operations) GetRunningJob(jobId scheduler.JobId) (*scheduler.JobEntry, error) {
+	return o.runner.RunningState(jobId)
 }
 
-// GetJobHistory returns a list of history for all jobs that have ever been run on the server. It could be that in the
-// future this will only return the history of the currently registered jobs.
-// Each job stores its Start and End time, together with the last error if any.
-func (api *Api) GetJobHistory() []*jobResult {
+func (api *Api) GetJobHistory(jobId scheduler.JobId, limit int) ([]*scheduler.JobHistory, error) {
+	return api.store.GetJobHistory(jobId, limit)
+}
+
+// ListJobHistory returns a list of history for all jobs that have ever been run on the server.
+func (api *Api) ListJobHistory() []*jobResult {
 	items, _ := api.store.ListJobHistory(-1)
 	results := make([]*jobResult, 0)
 
@@ -179,7 +198,7 @@ func (api *Api) GetJobHistory() []*jobResult {
 	return results
 }
 
-func (o *operations) Pause(jobId scheduler.JobId) error {
+func (o *operations) Enable(jobId scheduler.JobId) error {
 	config, err := o.store.GetConfiguration(jobId)
 	if err != nil {
 		return nil
@@ -187,11 +206,16 @@ func (o *operations) Pause(jobId scheduler.JobId) error {
 	if config == nil {
 		return fmt.Errorf("missing config with id %s", jobId)
 	}
-	config.Paused = true
-	return o.store.SaveConfiguration(jobId, config)
+	config.Enabled = true
+
+	err = o.store.SaveConfiguration(jobId, config)
+	if err != nil {
+		return err
+	}
+	return o.runner.ForceReload(jobId)
 }
 
-func (o *operations) Resume(jobId scheduler.JobId) error {
+func (o *operations) Disable(jobId scheduler.JobId) error {
 	config, err := o.store.GetConfiguration(jobId)
 	if err != nil {
 		return nil
@@ -199,8 +223,13 @@ func (o *operations) Resume(jobId scheduler.JobId) error {
 	if config == nil {
 		return fmt.Errorf("missing config with id %s", jobId)
 	}
-	config.Paused = false
-	return o.store.SaveConfiguration(jobId, config)
+	config.Enabled = false
+
+	err = o.store.SaveConfiguration(jobId, config)
+	if err != nil {
+		return err
+	}
+	return o.runner.ForceReload(jobId)
 }
 
 func (o *operations) Run(jobId scheduler.JobId) error {
@@ -209,14 +238,10 @@ func (o *operations) Run(jobId scheduler.JobId) error {
 		return nil
 	}
 	if config == nil {
-		return fmt.Errorf("missing config with id %s", jobId)
-	}
-	job, err := config.ToJob(false)
-	if err != nil {
-		return err
+		return fmt.Errorf("%w with id %s", ErrJobNotFound, jobId)
 	}
 
-	return o.runner.RunJob(context.Background(), job)
+	return o.runner.RunJob(context.Background(), jobId)
 }
 
 func (o *operations) Terminate(jobId scheduler.JobId) error {
@@ -230,23 +255,48 @@ func (o *operations) Reset(jobId scheduler.JobId, since string) error {
 	if err != nil {
 		return err
 	}
+	if jobConfiguration == nil {
+		return fmt.Errorf("%w with id '%s'", ErrJobNotFound, jobId)
+	}
 	o.logger.Infof("Resetting since token for job with id '%s' (%s)", jobId, jobConfiguration.Title)
 
-	syncJobState := &SyncJobState{}
-	err = o.ds.GetObject(server.JOB_DATA_INDEX, string(jobId), syncJobState)
-	if err != nil {
-		return err
-	}
-
-	if syncJobState.ID == "" {
-		return nil
-	}
-
-	syncJobState.ContinuationToken = since
-	err = o.ds.StoreObject(server.JOB_DATA_INDEX, string(jobId), syncJobState)
-	if err != nil {
-		return err
+	for _, task := range jobConfiguration.Tasks {
+		err := o.store.DeleteTask(jobId, task.Id) // we must also delete the current task state, not just the since state
+		if err != nil {
+			return err
+		}
+		state, err := o.state.Get(jobId, task.Id)
+		if err != nil {
+			return err
+		}
+		state.ContinuationToken = since
+		err = o.state.Update(jobId, task.Id, state)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+func (o *operations) ResetTask(jobId scheduler.JobId, taskId, since string) error {
+	jobConfiguration, err := o.store.GetConfiguration(jobId)
+	if err != nil {
+		return err
+	}
+	if jobConfiguration == nil {
+		return fmt.Errorf("%w with id '%s'", ErrJobNotFound, jobId)
+	}
+	o.logger.Infof("Resetting since token for task with id '%s' (%s)", taskId, jobConfiguration.Title)
+	err = o.store.DeleteTask(jobId, taskId) // we must also delete the current task state, not just the since state
+	if err != nil {
+		return err
+	}
+
+	state, err := o.state.Get(jobId, taskId)
+	if err != nil {
+		return err
+	}
+	state.ContinuationToken = since
+	return o.state.Update(jobId, taskId, state)
 }

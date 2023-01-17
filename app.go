@@ -31,7 +31,7 @@ import (
 func wire() *fx.App {
 	return fx.New(
 		fx.Options(
-			fx.StartTimeout(60*time.Second),
+			fx.StartTimeout(600*time.Second),
 		),
 		fx.Provide(
 			conf.NewEnv,
@@ -43,10 +43,10 @@ func wire() *fx.App {
 			server.NewDsManager,
 			security.NewProviderManager,
 			security.NewTokenProviders,
-			jobs.NewRunner,
 			jobs.NewScheduler,
 			jobs.NewV2Scheduler,
 			jobs.NewDataHubJobStore,
+			jobs.NewDataHubSyncState,
 			jobs.NewApi,
 			content.NewContent,
 			web.NewAuthorizer,

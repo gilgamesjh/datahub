@@ -82,7 +82,7 @@ func (auth0 *JwtBearerProvider) Authorize(req *http.Request) {
 func (auth0 *JwtBearerProvider) token() (string, error) {
 	token, err := auth0.generateOrGetToken()
 	if err != nil {
-		auth0.logger.Warnf("Error getting token: %w", err.Error())
+		auth0.logger.Warnf("Error getting token: %v", err)
 		return "", err
 	}
 	return fmt.Sprintf("Bearer %s", token), nil

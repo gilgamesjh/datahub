@@ -16,6 +16,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"github.com/mimiro-io/internal-go-util/pkg/scheduler"
 	"net/http"
 
@@ -39,11 +40,14 @@ func NewJobOperationHandler(lc fx.Lifecycle, e *echo.Echo, logger *zap.SugaredLo
 
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
-			e.PUT("/job/:jobid/pause", handler.jobsPause, mw.authorizer(log, datahubWrite))
-			e.PUT("/job/:jobid/resume", handler.jobsUnpause, mw.authorizer(log, datahubWrite))
+			e.PUT("/job/:jobid/pause", handler.jobsDisable, mw.authorizer(log, datahubWrite))
+			e.PUT("/job/:jobid/resume", handler.jobsEnable, mw.authorizer(log, datahubWrite))
+			e.PUT("/job/:jobid/disable", handler.jobsDisable, mw.authorizer(log, datahubWrite))
+			e.PUT("/job/:jobid/enable", handler.jobsEnable, mw.authorizer(log, datahubWrite))
 			e.PUT("/job/:jobid/kill", handler.jobsKill, mw.authorizer(log, datahubWrite))
 			e.PUT("/job/:jobid/run", handler.jobsRun, mw.authorizer(log, datahubWrite))
 			e.PUT("/job/:jobid/reset", handler.jobsReset, mw.authorizer(log, datahubWrite))
+			e.PUT("/job/:jobid/task/:taskId/reset", handler.taskReset, mw.authorizer(log, datahubWrite))
 			e.GET("/job/:jobid/status", handler.jobsGetStatus, mw.authorizer(log, datahubRead)) // is it running
 
 			return nil
@@ -51,11 +55,20 @@ func NewJobOperationHandler(lc fx.Lifecycle, e *echo.Echo, logger *zap.SugaredLo
 	})
 }
 
-func (handler *jobOperationHandler) jobsPause(c echo.Context) error {
+func (handler *jobOperationHandler) jobsEnable(c echo.Context) error {
 	jobId := c.Param("jobid")
-	err := handler.api.Operations.Pause(scheduler.JobId(jobId))
+	err := handler.api.Operations.Enable(scheduler.JobId(jobId))
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, "could not pause job")
+		return echo.NewHTTPError(http.StatusInternalServerError, "could not enable job")
+	}
+	return c.JSON(http.StatusOK, &JobResponse{JobId: jobId})
+}
+
+func (handler *jobOperationHandler) jobsDisable(c echo.Context) error {
+	jobId := c.Param("jobid")
+	err := handler.api.Operations.Disable(scheduler.JobId(jobId))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "could not disable job")
 	}
 	return c.JSON(http.StatusOK, &JobResponse{JobId: jobId})
 }
@@ -65,15 +78,6 @@ func (handler *jobOperationHandler) jobsKill(c echo.Context) error {
 	err := handler.api.Operations.Terminate(scheduler.JobId(jobId))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-	return c.JSON(http.StatusOK, &JobResponse{JobId: jobId})
-}
-
-func (handler *jobOperationHandler) jobsUnpause(c echo.Context) error {
-	jobId := c.Param("jobid")
-	err := handler.api.Operations.Resume(scheduler.JobId(jobId))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "could not un-pause job")
 	}
 	return c.JSON(http.StatusOK, &JobResponse{JobId: jobId})
 }
@@ -88,13 +92,31 @@ func (handler *jobOperationHandler) jobsRun(c echo.Context) error {
 	return c.JSON(http.StatusOK, &JobResponse{JobId: "0"})
 }
 
+func (handler *jobOperationHandler) taskReset(c echo.Context) error {
+	jobId := c.Param("jobid")
+	taskId := c.Param("taskId")
+	since := c.QueryParam("since")
+
+	err := handler.api.Operations.ResetTask(scheduler.JobId(jobId), taskId, since)
+	if err != nil {
+		if errors.Is(err, jobs.ErrJobNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound, err.Error())
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, &JobResponse{JobId: jobId})
+}
+
 func (handler *jobOperationHandler) jobsReset(c echo.Context) error {
 	jobId := c.Param("jobid")
 	since := c.QueryParam("since")
 
 	err := handler.api.Operations.Reset(scheduler.JobId(jobId), since)
 	if err != nil {
-		return c.JSON(http.StatusInternalServerError, "internal error")
+		if errors.Is(err, jobs.ErrJobNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound, err.Error())
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, &JobResponse{JobId: jobId})
 }
@@ -102,10 +124,13 @@ func (handler *jobOperationHandler) jobsReset(c echo.Context) error {
 func (handler *jobOperationHandler) jobsGetStatus(c echo.Context) error {
 	jobId := c.Param("jobid")
 
-	status := handler.api.Operations.GetRunningJob(scheduler.JobId(jobId))
+	status, err := handler.api.Operations.GetRunningJob(scheduler.JobId(jobId))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
 	if status == nil {
-		return c.JSON(http.StatusOK, []*jobs.JobStatus{})
+		return c.JSON(http.StatusOK, []*scheduler.JobEntry{})
 	}
 
-	return c.JSON(http.StatusOK, []*jobs.JobStatus{status}) // converted to a list
+	return c.JSON(http.StatusOK, []*scheduler.JobEntry{status}) // converted to a list
 }

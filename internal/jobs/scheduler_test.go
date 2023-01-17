@@ -1032,8 +1032,12 @@ func setupScheduler(storeLocation string, t *testing.T) (*Scheduler, *server.Sto
 		Runner:   runner,
 		JobStore: scheduler.NewInMemoryStore(),
 	}
+	v2 := scheduler.NewJobRunner(
+		scheduler.NewJobScheduler(zap.NewNop().Sugar(), "test1", scheduler.NewInMemoryStore(), 1),
+		scheduler.NewTaskScheduler(zap.NewNop().Sugar(), "test2", scheduler.NewInMemoryStore(), 1),
+		&statsd.NoOpClient{})
 
-	s := NewScheduler(lc, e, p)
+	s := NewScheduler(lc, e, p, v2, NewApi(e, p, v2))
 
 	// undo redirect of stdout after successful init of fx and jobrunner
 	os.Stdout = oldStd

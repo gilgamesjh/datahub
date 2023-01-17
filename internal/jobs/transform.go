@@ -240,7 +240,14 @@ func (javascriptTransform *JavascriptTransform) getParallelism() int {
 // Clone clones the transform for use in parallel processing
 func (javascriptTransform *JavascriptTransform) Clone() (*JavascriptTransform, error) {
 	code := base64.StdEncoding.EncodeToString(javascriptTransform.Code)
-	return newJavascriptTransform(javascriptTransform.Logger, code, javascriptTransform.Store)
+	runtime, err := newJavascriptTransform(javascriptTransform.Logger, code, javascriptTransform.Store)
+	if err != nil {
+		return nil, err
+	}
+	// makes sure that also the cloned runtimes has access to the statsd client
+	runtime.statsDClient = javascriptTransform.statsDClient
+	runtime.statsDTags = javascriptTransform.statsDTags
+	return runtime, nil
 }
 
 func (javascriptTransform *JavascriptTransform) AsEntity(val interface{}) (res *server.Entity) {

@@ -18,6 +18,11 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/DataDog/datadog-go/v5/statsd"
+	"github.com/mimiro-io/datahub/internal/conf"
+	"github.com/mimiro-io/datahub/internal/security"
+	"github.com/mimiro-io/internal-go-util/pkg/scheduler"
+	"go.uber.org/zap"
 	"net/http"
 	"os"
 	"strconv"
@@ -32,16 +37,24 @@ import (
 	"github.com/mimiro-io/datahub/internal/server"
 )
 
+type pipelineTestSecurityProvider struct{}
+
+func (p pipelineTestSecurityProvider) Authorize(req *http.Request) {
+	// do nothing
+}
+
+var _ security.Provider = (*pipelineTestSecurityProvider)(nil)
+
 func TestPipeline(t *testing.T) {
 	g := goblin.Goblin(t)
 	g.Describe("A pipeline", func() {
 		testCnt := 0
 		var dsm *server.DsManager
-		var scheduler *Scheduler
 		var store *server.Store
 		var runner *Runner
 		var storeLocation string
 		var mockService MockService
+		var builder *pipelineBuilder
 		g.BeforeEach(func() {
 			// temp redirect of stdout and stderr to swallow some annoying init messages in fx and jobrunner and mockService
 			devNull, _ := os.Open("/dev/null")
@@ -58,7 +71,21 @@ func TestPipeline(t *testing.T) {
 			go func() {
 				_ = mockService.echo.Start(":7777")
 			}()
-			scheduler, store, runner, dsm, _ = setupScheduler(storeLocation, t)
+			_, store, runner, dsm, _ = setupScheduler(storeLocation, t)
+			builder = newPipelineBuilder(&conf.Env{
+				Logger: zap.NewNop().Sugar(),
+			}, SchedulerParams{
+				Store:    store,
+				Dsm:      dsm,
+				Runner:   runner,
+				Statsd:   &statsd.NoOpClient{},
+				EventBus: server.NoOpBus(),
+				TokenProviders: &security.TokenProviders{
+					Providers: &map[string]security.Provider{
+						"local": security.BasicProvider{User: "u100", Password: "p200"},
+					},
+				},
+			})
 
 			// undo redirect of stdout and stderr after successful init of fx and jobrunner
 			os.Stderr = oldErr
@@ -105,35 +132,27 @@ func TestPipeline(t *testing.T) {
 			`
 			jscriptEnc := base64.StdEncoding.EncodeToString([]byte(js))
 
-			// define job
-			jobJson := `
-		{
-			"id" : "sync-datasetsource-to-datasetsink-with-js",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "Products"
-			},
-			"transform" : {
-				"Type" : "JavascriptTransform",
-				"Code" : "` + jscriptEnc + `"
-			},
-			"sink" : {
-				"Type" : "DevNullSink"
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink-with-js",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "Products",
+				},
+				Transform: map[string]any{
+					"Type": "JavascriptTransform",
+					"Code": jscriptEnc,
+				},
+				Sink: map[string]any{
+					"Type": "DevNullSink",
+				},
+				Type: JobTypeIncremental,
 			}
-		}`
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil("pipeline is parsed")
+			pipeline, err := builder.buildV2(task)
 
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
-			}
+			g.Assert(err).IsNil("pipeline is parsed correctly")
 
-			job.Run()
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			// check number of entities in target dataset
 			peopleDataset := dsm.GetDataset("NewProducts")
@@ -181,35 +200,27 @@ func TestPipeline(t *testing.T) {
 			`
 			jscriptEnc := base64.StdEncoding.EncodeToString([]byte(js))
 
-			// define job
-			jobJson := `
-		{
-			"id" : "sync-datasetsource-to-datasetsink-with-js",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "Products"
-			},
-			"transform" : {
-				"Type" : "JavascriptTransform",
-				"Code" : "` + jscriptEnc + `"
-			},
-			"sink" : {
-				"Type" : "DevNullSink"
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink-with-js",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "Products",
+				},
+				Transform: map[string]any{
+					"Type": "JavascriptTransform",
+					"Code": jscriptEnc,
+				},
+				Sink: map[string]any{
+					"Type": "DevNullSink",
+				},
+				Type: JobTypeIncremental,
 			}
-		}`
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil("pipeline is parsed")
+			pipeline, err := builder.buildV2(task)
 
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
-			}
+			g.Assert(err).IsNil("pipeline is parsed correctly")
 
-			job.Run()
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			// check number of entities in target dataset
 			peopleDataset := dsm.GetDataset("NewProducts")
@@ -238,36 +249,28 @@ func TestPipeline(t *testing.T) {
 			g.Assert(err).IsNil("dataset.StoreEntites returns no error")
 
 			dsName := "fstohttp"
-			jobJson := `{
-			"id" : "sync-datasetssource-to-httpdatasetsink",
-			"triggers": [{"triggerType": "cron", "jobType": "fullsync", "schedule": "@every 2s"}],
-			"fullSyncSchedule" : "@every 2s",
-			"runOnce" : true,
-			"batchSize": 1,
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "Products"
-			},
-			"sink" : {
-				"Type" : "HttpDatasetSink",
-				"Url" : "http://localhost:7777/datasets/` + dsName + `/fullsync"
-			}}`
 
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeFull)
-			g.Assert(err).IsNil("jobConfig to Pipeline returns no error")
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+			task := &scheduler.TaskConfiguration{
+				Id:        "sync-datasetssource-to-httpdatasetsink",
+				BatchSize: 1,
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "Products",
+				},
+				Sink: map[string]any{
+					"Type": "HttpDatasetSink",
+					"Url":  "http://localhost:7777/datasets/" + dsName + "/fullsync",
+				},
+				Type: JobTypeFull,
 			}
+			pipeline, err := builder.buildV2(task)
+
+			g.Assert(err).IsNil("jobConfig to Pipeline returns no error")
 
 			g.Assert(pipeline.spec().batchSize).Eql(1, "Batch size should be 1")
 
-			job.Run()
-			g.Assert(len(scheduler.GetRunningJobs())).Eql(0, "running job list is empty, indicating job done")
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 			g.Assert(len(mockService.getRecordedEntitiesForDataset(dsName))).Eql(2, "both 'pages' have been posted")
 		})
 
@@ -276,31 +279,26 @@ func TestPipeline(t *testing.T) {
 			ds, _ := dsm.CreateDataset("People", nil)
 
 			// define job
-			jobJson := `{
-			"id" : "sync-httpdatasetsource-to-datasetsink",
-			"triggers": [{"triggerType": "cron", "jobType": "fullsync", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "HttpDatasetSource",
-				"Url" : "http://localhost:7777/datasets/people/changes"
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-				"Name" : "People"
-			}}`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeFull)
-			g.Assert(err).IsNil("jobConfig to Pipeline returns no error")
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+			task := &scheduler.TaskConfiguration{
+				Id:        "sync-httpdatasetsource-to-datasetsink",
+				BatchSize: 1,
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "People",
+				},
+				Source: map[string]any{
+					"Type": "HttpDatasetSource",
+					"Url":  "http://localhost:7777/datasets/people/changes",
+				},
+				Type: JobTypeFull,
 			}
 
-			job.Run()
-			g.Assert(len(scheduler.GetRunningJobs())).Eql(0, "running job list is empty")
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("jobConfig to Pipeline returns no error")
+
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed running the pipeline")
+
 			rs, err := ds.GetEntities("", 100)
 			g.Assert(err).IsNil("we found data in sink")
 			g.Assert(len(rs.Entities)).Eql(10, "we found 10 entites (MockService generates 10 results)")
@@ -311,33 +309,25 @@ func TestPipeline(t *testing.T) {
 			ds, _ := dsm.CreateDataset("People", nil)
 
 			// define job
-			jobJson := `
-		{
-			"id" : "sync-httpdatasetsource-to-datasetsink",
-			"triggers": [{"triggerType": "cron", "jobType": "fullsync", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "HttpDatasetSource",
-				"Url" : "http://localhost:7777/datasets/people/changeswithcontinuation"
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-				"Name" : "People"
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-httpdatasetsource-to-datasetsink",
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "People",
+				},
+				Source: map[string]any{
+					"Type": "HttpDatasetSource",
+					"Url":  "http://localhost:7777/datasets/people/changeswithcontinuation",
+				},
+				Type: JobTypeFull,
 			}
-		}`
 
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeFull)
+			pipeline, err := builder.buildV2(task)
 			g.Assert(err).IsNil("jobConfig to Pipeline returns no error")
 
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
-			}
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed the run")
 
-			job.Run()
-			g.Assert(len(scheduler.GetRunningJobs())).Eql(0, "running job list is empty")
 			rs, err := ds.GetEntities("", 100)
 			g.Assert(err).IsNil("we found data in sink")
 			g.Assert(len(rs.Entities)).Eql(20, "we found 10 entites (MockService generates 20 results)")
@@ -358,34 +348,25 @@ func TestPipeline(t *testing.T) {
 			err := ds.StoreEntities(entities)
 			g.Assert(err).IsNil("Entities are stored correctly")
 
-			// define job
-			jobJson := `
-		{
-			"id" : "sync-datasetssource-to-httpdatasetsink",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "Products"
-			},
-			"sink" : {
-				"Type" : "HttpDatasetSink",
-				"Url" : "http://localhost:7777/datasets/writeabledevnull"
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetssource-to-httpdatasetsink",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "Products",
+				},
+				Sink: map[string]any{
+					"Type": "HttpDatasetSink",
+					"Url":  "http://localhost:7777/datasets/writeabledevnull",
+				},
+				Type: JobTypeIncremental,
 			}
-		}`
+			pipeline, err := builder.buildV2(task)
 
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
 			g.Assert(err).IsNil("pipeline is parsed correctly")
 
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
-			}
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil()
 
-			job.Run()
-			g.Assert(len(scheduler.GetRunningJobs())).Eql(0, "running job list not empty")
 		})
 
 		g.It("Should incrementally do internal sync with js transform in parallel", func() {
@@ -407,37 +388,28 @@ func TestPipeline(t *testing.T) {
 			g.Assert(err).IsNil("entities are stored")
 
 			// define job
-			jobJson := `
-		{
-			"id" : "sync-datasetsource-to-datasetsink-with-js",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "Products"
-			},
-			"transform" : {
-				"Type" : "JavascriptTransform",
-				"Parallelism" : 10,
-				"Code" : "ZnVuY3Rpb24gdHJhbnNmb3JtX2VudGl0aWVzKGVudGl0aWVzKSB7CiAgIHZhciBzdGFydHMgPSBbXTsKICAgdmFyIHJlcyA9IFF1ZXJ5KHN0YXJ0cywgInRlc3QiLCBmYWxzZSk7CiAgIHJldHVybiBlbnRpdGllczsKfQo="
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-                "Name" : "NewProducts"
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink-with-js",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "Products",
+				},
+				Transform: map[string]any{
+					"Type":        "JavascriptTransform",
+					"Code":        "ZnVuY3Rpb24gdHJhbnNmb3JtX2VudGl0aWVzKGVudGl0aWVzKSB7CiAgIHZhciBzdGFydHMgPSBbXTsKICAgdmFyIHJlcyA9IFF1ZXJ5KHN0YXJ0cywgInRlc3QiLCBmYWxzZSk7CiAgIHJldHVybiBlbnRpdGllczsKfQo=",
+					"Parallelism": 10.0,
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "NewProducts",
+				},
+				Type: JobTypeIncremental,
 			}
-		}`
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("pipeline is parsed correctly")
 
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil("pipeline is parsed")
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
-			}
-
-			job.Run()
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run pipeline")
 
 			// check number of entities in target dataset
 			peopleDataset := dsm.GetDataset("NewProducts")
@@ -469,36 +441,27 @@ func TestPipeline(t *testing.T) {
 			g.Assert(err).IsNil("entities are stored")
 
 			// define job
-			jobJson := `
-		{
-			"id" : "sync-datasetsource-to-datasetsink-with-js",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "Products"
-			},
-			"transform" : {
-				"Type" : "JavascriptTransform",
-				"Code" : "ZnVuY3Rpb24gdHJhbnNmb3JtX2VudGl0aWVzKGVudGl0aWVzKSB7CiAgIHZhciBzdGFydHMgPSBbXTsKICAgdmFyIHJlcyA9IFF1ZXJ5KHN0YXJ0cywgInRlc3QiLCBmYWxzZSk7CiAgIHJldHVybiBlbnRpdGllczsKfQo="
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-                "Name" : "NewProducts"
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink-with-js",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "Products",
+				},
+				Transform: map[string]any{
+					"Type": "JavascriptTransform",
+					"Code": "ZnVuY3Rpb24gdHJhbnNmb3JtX2VudGl0aWVzKGVudGl0aWVzKSB7CiAgIHZhciBzdGFydHMgPSBbXTsKICAgdmFyIHJlcyA9IFF1ZXJ5KHN0YXJ0cywgInRlc3QiLCBmYWxzZSk7CiAgIHJldHVybiBlbnRpdGllczsKfQo=",
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "NewProducts",
+				},
+				Type: JobTypeIncremental,
 			}
-		}`
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("pipeline is parsed correctly")
 
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil("pipeline is parsed")
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
-			}
-
-			job.Run()
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			// check number of entities in target dataset
 			peopleDataset := dsm.GetDataset("NewProducts")
@@ -527,36 +490,28 @@ func TestPipeline(t *testing.T) {
 			g.Assert(err).IsNil("entities are stored")
 
 			// define job
-			jobJson := `
-		{
-			"id" : "sync-datasetsource-to-datasetsink-with-js",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "Products"
-			},
-			"transform" : {
-				"Type" : "JavascriptTransform",
-				"Code" : "ZnVuY3Rpb24gdHJhbnNmb3JtX2VudGl0aWVzKGVudGl0aWVzKSB7CiAgIHZhciBzdGFydHMgPSBbXTsKICAgdmFyIHJlcyA9IFF1ZXJ5KHN0YXJ0cywgInRlc3QiLCBmYWxzZSk7CiAgIHJldHVybiBlbnRpdGllczsKfQo="
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-                "Name" : "NewProducts"
-			}
-		}`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil("pipeline is parsed")
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink-with-js",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "Products",
+				},
+				Transform: map[string]any{
+					"Type": "JavascriptTransform",
+					"Code": "ZnVuY3Rpb24gdHJhbnNmb3JtX2VudGl0aWVzKGVudGl0aWVzKSB7CiAgIHZhciBzdGFydHMgPSBbXTsKICAgdmFyIHJlcyA9IFF1ZXJ5KHN0YXJ0cywgInRlc3QiLCBmYWxzZSk7CiAgIHJldHVybiBlbnRpdGllczsKfQo=",
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "NewProducts",
+				},
+				Type: JobTypeIncremental,
 			}
 
-			job.Run()
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("pipeline is parsed correctly")
+
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			// check number of entities in target dataset
 			peopleDataset := dsm.GetDataset("NewProducts")
@@ -606,34 +561,28 @@ func TestPipeline(t *testing.T) {
 		    return entities;
 		}`
 			// define job
-			jobJson := fmt.Sprintf(`{
-			"id" : "sync-datasetsource-to-datasetsink-with-js-and-query",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "People"
-			},
-			"transform" : {
-				"Type" : "JavascriptTransform",
-				"Code" : "%v"
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-                "Name" : "NewPeople"
-			}}`, base64.StdEncoding.EncodeToString([]byte(jsFun)))
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil()
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink-with-js-and-query",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "People",
+				},
+				Transform: map[string]any{
+					"Type": "JavascriptTransform",
+					"Code": base64.StdEncoding.EncodeToString([]byte(jsFun)),
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "NewPeople",
+				},
+				Type: JobTypeIncremental,
 			}
 
-			job.Run()
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("pipeline is parsed correctly")
+
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			// check number of entities in target dataset
 			peopleDataset := dsm.GetDataset("NewPeople")
@@ -692,35 +641,30 @@ func TestPipeline(t *testing.T) {
 
 		    return result;
 		}`
+
 			// define job
-			jobJson := fmt.Sprintf(`{
-			"id" : "sync-datasetsource-to-datasetsink-with-js-and-query",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "People"
-			},
-			"transform" : {
-				"Type" : "JavascriptTransform",
-				"Code" : "%v"
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-                "Name" : "NewPeople"
-			}}`, base64.StdEncoding.EncodeToString([]byte(jsFun)))
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil()
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink-with-js-and-query",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "People",
+				},
+				Transform: map[string]any{
+					"Type": "JavascriptTransform",
+					"Code": base64.StdEncoding.EncodeToString([]byte(jsFun)),
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "NewPeople",
+				},
+				Type: JobTypeIncremental,
 			}
 
-			job.Run()
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("pipeline is parsed correctly")
+
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			// check number of entities in target dataset
 			peopleDataset := dsm.GetDataset("NewPeople")
@@ -747,34 +691,28 @@ func TestPipeline(t *testing.T) {
 			g.Assert(ds.StoreEntities(entities)).IsNil()
 
 			// define job
-			jobJson := `{
-			"id" : "sync-datasetsource-to-datasetsink",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "Products"
-			},
-			"transform" : {
-				"Type" : "HttpTransform",
-				"Url" : "http://localhost:7777/transforms/identity"
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-                "Name" : "NewProducts"
-			}}`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil()
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "Products",
+				},
+				Transform: map[string]any{
+					"Type": "HttpTransform",
+					"Url":  "http://localhost:7777/transforms/identity",
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "NewProducts",
+				},
+				Type: JobTypeIncremental,
 			}
 
-			job.Run()
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("pipeline is parsed correctly")
+
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			// check number of entities in target dataset
 			peopleDataset := dsm.GetDataset("NewProducts")
@@ -784,30 +722,25 @@ func TestPipeline(t *testing.T) {
 		})
 
 		g.It("Should not write to the sink if an external transform endpoint is 404", func() {
-			jobJson := ` {
-			"id" : "sync-httpdatasetsource-to-datasetsink-1",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "HttpDatasetSource",
-				"Url" : "http://localhost:7777/datasetsarecool/people/changes"
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-				"Name" : "People"
-			} }`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil()
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink-1",
+				Source: map[string]any{
+					"Type": "HttpDatasetSource",
+					"Url":  "http://localhost:7777/datasetsarecool/people/changes",
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "People",
+				},
+				Type: JobTypeIncremental,
 			}
 
-			job.Run()
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("pipeline is parsed correctly")
+
+			err = pipeline.sync(context.Background())
+
+			g.Assert(err).IsNotNil("should have failed")
 			g.Assert(dsm.GetDataset("People")).IsZero("dataset should not exist as job failed")
 		})
 
@@ -824,30 +757,24 @@ func TestPipeline(t *testing.T) {
 
 			g.Assert(ds.StoreEntities(entities)).IsNil()
 
-			jobJson := ` {
-			"id" : "sync-datasetsource-to-datasetsink",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "Products"
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-                "Name" : "NewProducts"
-			} }`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil()
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "Products",
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "NewProducts",
+				},
+				Type: JobTypeIncremental,
 			}
 
-			job.Run()
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("pipeline is parsed correctly")
+
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			// check number of entities in target dataset
 			peopleDataset := dsm.GetDataset("NewProducts")
@@ -859,30 +786,24 @@ func TestPipeline(t *testing.T) {
 		g.It("Should copy from samplesource to datasetsink in first run of new job", func() {
 			_, _ = dsm.CreateDataset("People", nil)
 
-			jobJson := `{
-			"id" : "sync-samplesource-to-datasetsink",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "SampleSource",
-				"NumberOfEntities" : 1
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-				"Name" : "People"
-			}}`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil()
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink",
+				Source: map[string]any{
+					"Type":             "SampleSource",
+					"NumberOfEntities": 1.0,
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "People",
+				},
+				Type: JobTypeIncremental,
 			}
 
-			job.Run()
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("pipeline is parsed correctly")
+
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			// get entities from people dataset
 			peopleDataset := dsm.GetDataset("People")
@@ -894,30 +815,24 @@ func TestPipeline(t *testing.T) {
 		g.It("Should copy from HttpDatasetSource to datasetSink in first run of new job", func() {
 			_, _ = dsm.CreateDataset("People", nil)
 
-			jobJson := `{
-			"id" : "sync-httpdatasetsource-to-datasetsink-1",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "HttpDatasetSource",
-				"Url" : "http://localhost:7777/datasets/people/changes"
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-				"Name" : "People"
-			}}`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil()
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink-1",
+				Source: map[string]any{
+					"Type": "HttpDatasetSource",
+					"Url":  "http://localhost:7777/datasets/people/changes",
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "People",
+				},
+				Type: JobTypeIncremental,
 			}
 
-			job.Run()
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("pipeline is parsed correctly")
+
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			// get entities from people dataset
 			peopleDataset := dsm.GetDataset("People")
@@ -928,31 +843,24 @@ func TestPipeline(t *testing.T) {
 		g.It("Should copy all pages using continuatin tokens from httpDatasetSource to datasetSink if first run", func() {
 			_, _ = dsm.CreateDataset("People", nil)
 
-			jobJson := `{
-			"id" : "sync-httpdatasetsource-to-datasetsink-1",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "HttpDatasetSource",
-				"Url" : "http://localhost:7777/datasets/people/changeswithcontinuation"
-			},
-			"sink" : {
-				"Type" : "DatasetSink",
-				"Name" : "People"
-			} }`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil()
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink-1",
+				Source: map[string]any{
+					"Type": "HttpDatasetSource",
+					"Url":  "http://localhost:7777/datasets/people/changeswithcontinuation",
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "People",
+				},
+				Type: JobTypeIncremental,
 			}
 
-			// run once
-			job.Run()
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil("pipeline is parsed correctly")
+
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			// get entities from people dataset
 			peopleDataset := dsm.GetDataset("People")
@@ -961,7 +869,7 @@ func TestPipeline(t *testing.T) {
 			g.Assert(len(result.Entities)).Eql(20)
 
 			// run again
-			job.Run()
+			_ = pipeline.sync(context.Background())
 			peopleDataset = dsm.GetDataset("People")
 			result, err = peopleDataset.GetEntities("", 50)
 			g.Assert(err).IsNil()
@@ -969,6 +877,7 @@ func TestPipeline(t *testing.T) {
 		})
 
 		g.It("Should mark entities that have not been received again during fullsync to internal dataset as deleted", func() {
+			g.Timeout(1 * time.Hour)
 			sourceDs, _ := dsm.CreateDataset("people", nil)
 			sinkDs, _ := dsm.CreateDataset("people2", nil)
 
@@ -976,15 +885,23 @@ func TestPipeline(t *testing.T) {
 			e2 := server.NewEntity("2", 0)
 			_ = sourceDs.StoreEntities([]*server.Entity{e1, e2})
 
-			pipeline := &FullSyncPipeline{PipelineSpec{
-				source: &source.DatasetSource{DatasetName: "people", Store: store, DatasetManager: dsm},
-				sink:   &datasetSink{DatasetName: "people2", Store: store, DatasetManager: dsm},
-			}}
+			task := &scheduler.TaskConfiguration{
+				Id: "fullsync-1x",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "people",
+				},
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "people2",
+				},
+				Type: JobTypeFull,
+			}
 
-			job := &job{id: "fullsync-1", pipeline: pipeline, runner: runner}
+			pipeline, err := builder.buildV2(task)
 
 			// run once, both entities should sync
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			res, err := sinkDs.GetEntities("", 100)
 			g.Assert(err).IsNil()
@@ -1000,7 +917,7 @@ func TestPipeline(t *testing.T) {
 			g.Assert(sourceDs.StoreEntities([]*server.Entity{e2})).IsNil()
 
 			// run again. deletion detection should apply
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			res, err = sinkDs.GetEntities("", 100)
 			g.Assert(err).IsNil()
@@ -1012,18 +929,26 @@ func TestPipeline(t *testing.T) {
 
 		})
 		g.It("Should store continuation token after every page in incremental job", func() {
-			pipeline := &IncrementalPipeline{PipelineSpec{
-				batchSize: 5,
-				source:    &source.SampleSource{NumberOfEntities: 10, Store: store},
-				sink:      &httpDatasetSink{Endpoint: "http://localhost:7777/datasets/inctest/fullsync", Store: store},
-			}}
-			job := &job{id: "inc-1", pipeline: pipeline, runner: runner}
+			task := &scheduler.TaskConfiguration{
+				Id:        "inc-1",
+				BatchSize: 5,
+				Source: map[string]any{
+					"Type":             "SampleSource",
+					"NumberOfEntities": 10.0,
+				},
+				Sink: map[string]any{
+					"Type": "HttpDatasetSink",
+					"Url":  "http://localhost:7777/datasets/inctest/fullsync",
+				},
+				Type: JobTypeIncremental,
+			}
+			pipeline, _ := builder.buildV2(task)
 
 			//run async, so we can verify tokens in parallel
 			wg := sync.WaitGroup{}
 			wg.Add(1)
 			go func() {
-				job.Run()
+				_ = pipeline.sync(context.Background())
 				wg.Done()
 			}()
 
@@ -1035,32 +960,38 @@ func TestPipeline(t *testing.T) {
 			//block for next batch request finished - this should be before syncState is updated
 			_ = <-mockService.HttpNotificationChannel
 			syncJobState := &SyncJobState{}
-			err := store.GetObject(server.JOB_DATA_INDEX, job.id, syncJobState)
+			err := store.GetObject(server.JOB_DATA_INDEX, task.Id, syncJobState)
 			g.Assert(err).IsNil()
 			token := syncJobState.ContinuationToken
 			g.Assert(token).Eql("5", "Between batch 1 and 2, token should be continuation of batch 1")
 
 			wg.Wait()
 			syncJobState = &SyncJobState{}
-			err = store.GetObject(server.JOB_DATA_INDEX, job.id, syncJobState)
+			err = store.GetObject(server.JOB_DATA_INDEX, task.Id, syncJobState)
 			g.Assert(err).IsNil()
 			token = syncJobState.ContinuationToken
 			g.Assert(token).Eql("10")
 		})
 		g.It("Should store continuation token only after finished run in fullsync job", func() {
-			pipeline := &FullSyncPipeline{PipelineSpec{
-				batchSize: 5,
-				source:    &source.SampleSource{NumberOfEntities: 10, Store: store},
-				//sink:      &httpDatasetSink{Endpoint: "http://localhost:7777/datasets/fulltest/fullsync", Store: store},
-				sink: &devNullSink{},
-			}}
-			job := &job{id: "full-1", pipeline: pipeline, runner: runner}
+			task := &scheduler.TaskConfiguration{
+				Id:        "full-1",
+				BatchSize: 5,
+				Source: map[string]any{
+					"Type":             "SampleSource",
+					"NumberOfEntities": 10.0,
+				},
+				Sink: map[string]any{
+					"Type": "DevNullSink",
+				},
+				Type: JobTypeFull,
+			}
+			pipeline, _ := builder.buildV2(task)
 
 			//run async, so we can verify tokens in parallel
 			wg := sync.WaitGroup{}
 			wg.Add(1)
 			go func() {
-				job.Run()
+				_ = pipeline.sync(context.Background())
 				wg.Done()
 			}()
 			//block and wait for channel notification - indicating the first page/batch has been received
@@ -1071,7 +1002,7 @@ func TestPipeline(t *testing.T) {
 			//wait for first syncState (token) update in badger (should be in db when 2nd batch arrives)
 			//_ = <-mockService.HttpNotificationChannel
 			syncJobState := &SyncJobState{}
-			err := store.GetObject(server.JOB_DATA_INDEX, job.id, syncJobState)
+			err := store.GetObject(server.JOB_DATA_INDEX, task.Id, syncJobState)
 			g.Assert(err).IsNil()
 			token := syncJobState.ContinuationToken
 			g.Assert(token).Eql("", "there should not be a token stored after first batch")
@@ -1079,7 +1010,7 @@ func TestPipeline(t *testing.T) {
 			//wait for job to finish
 			wg.Wait()
 			syncJobState = &SyncJobState{}
-			err = store.GetObject(server.JOB_DATA_INDEX, job.id, syncJobState)
+			err = store.GetObject(server.JOB_DATA_INDEX, task.Id, syncJobState)
 			g.Assert(err).IsNil()
 			token = syncJobState.ContinuationToken
 			g.Assert(token).Eql("10", "First after job there should be a token")
@@ -1102,13 +1033,21 @@ func TestPipeline(t *testing.T) {
 			g.Assert(err).IsNil()
 			g.Assert(len(sourceChanges)).Eql(4, "Expected 4 changes for our two entities in source")
 
-			pipeline := &IncrementalPipeline{PipelineSpec{
-				batchSize: 5,
-				source:    &source.DatasetSource{DatasetName: "src", Store: store, DatasetManager: dsm},
-				sink:      &httpDatasetSink{Endpoint: "http://localhost:7777/datasets/inctest/fullsync", Store: store},
-			}}
-			job := &job{id: "inc-1", pipeline: pipeline, runner: runner}
-			job.Run()
+			task := &scheduler.TaskConfiguration{
+				Id:        "inc-1",
+				BatchSize: 5,
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "src",
+				},
+				Sink: map[string]any{
+					"Type": "HttpDatasetSink",
+					"Url":  "http://localhost:7777/datasets/inctest/fullsync",
+				},
+				Type: JobTypeIncremental,
+			}
+			pipeline, _ := builder.buildV2(task)
+			_ = pipeline.sync(context.Background())
 			sinkChanges := mockService.getRecordedEntitiesForDataset("inctest")
 			g.Assert(len(sinkChanges)).Eql(4, "Expected all 4 changes in sink for incremental")
 		})
@@ -1130,13 +1069,21 @@ func TestPipeline(t *testing.T) {
 			g.Assert(err).IsNil()
 			g.Assert(len(sourceChanges)).Eql(4, "Expected 4 changes for our two entities in source")
 
-			pipeline := &FullSyncPipeline{PipelineSpec{
-				batchSize: 5,
-				source:    &source.DatasetSource{DatasetName: "src", Store: store, DatasetManager: dsm},
-				sink:      &httpDatasetSink{Endpoint: "http://localhost:7777/datasets/fulltest/fullsync", Store: store},
-			}}
-			job := &job{id: "inc-1", pipeline: pipeline, runner: runner}
-			job.Run()
+			task := &scheduler.TaskConfiguration{
+				Id:        "inc-1",
+				BatchSize: 5,
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "src",
+				},
+				Sink: map[string]any{
+					"Type": "HttpDatasetSink",
+					"Url":  "http://localhost:7777/datasets/fulltest/fullsync",
+				},
+				Type: JobTypeFull,
+			}
+			pipeline, _ := builder.buildV2(task)
+			_ = pipeline.sync(context.Background())
 			sinkChanges := mockService.getRecordedEntitiesForDataset("fulltest")
 			g.Assert(len(sinkChanges)).Eql(2, "Expected only 2 entities in current state in fullsync")
 
@@ -1154,21 +1101,39 @@ func TestPipeline(t *testing.T) {
 				server.NewEntity("4", 0),
 				server.NewEntity("5", 0)})
 
-			pipeline := &FullSyncPipeline{PipelineSpec{
-				batchSize: 5,
-				source: &source.MultiSource{DatasetName: "src", Store: store, DatasetManager: dsm, Dependencies: []source.Dependency{
-					{Dataset: "dep", Joins: []source.Join{{Dataset: "src", Predicate: "http:/a/predicate", Inverse: false}}},
-				}},
-				sink: &httpDatasetSink{Endpoint: "http://localhost:7777/datasets/fulltest/fullsync", Store: store},
-			}}
-			job := &job{id: "fs-1", pipeline: pipeline, runner: runner}
-			job.Run()
+			task := &scheduler.TaskConfiguration{
+				Id:        "fs-1",
+				BatchSize: 5,
+				Source: map[string]any{
+					"Type": "MultiSource",
+					"Name": "src",
+					"Dependencies": []any{
+						map[string]any{
+							"dataset": "dep",
+							"joins": []any{
+								map[string]any{
+									"dataset":   "src",
+									"predicate": "http:/a/predicate",
+									"inverse":   false,
+								},
+							},
+						},
+					},
+				},
+				Sink: map[string]any{
+					"Type": "HttpDatasetSink",
+					"Url":  "http://localhost:7777/datasets/fulltest/fullsync",
+				},
+				Type: JobTypeFull,
+			}
+			pipeline, _ := builder.buildV2(task)
+			_ = pipeline.sync(context.Background())
 
 			sinkChanges := mockService.getRecordedEntitiesForDataset("fulltest")
 			g.Assert(len(sinkChanges)).Eql(2, "Expected only 2 entities in current state in fullsync")
 
 			syncJobState := &SyncJobState{}
-			err := store.GetObject(server.JOB_DATA_INDEX, job.id, syncJobState)
+			err := store.GetObject(server.JOB_DATA_INDEX, task.Id, syncJobState)
 			g.Assert(err).IsNil()
 			token := syncJobState.ContinuationToken
 			g.Assert(token).Eql("{\"MainToken\":\"2\",\"DependencyTokens\":{\"dep\":{\"Token\":\"3\"}}}",
@@ -1190,7 +1155,7 @@ func TestPipeline(t *testing.T) {
 				server.NewEntity(ns+":4", 0),
 				server.NewEntity(ns+":5", 0)})
 
-			pipeline := &IncrementalPipeline{PipelineSpec{
+			/*pipeline := &IncrementalPipeline{PipelineSpec{
 				batchSize: 5,
 				source: &source.MultiSource{DatasetName: "src", Store: store, DatasetManager: dsm, Dependencies: []source.Dependency{
 					{Dataset: "dep", Joins: []source.Join{{Dataset: "src", Predicate: ns + ":predicate", Inverse: false}}},
@@ -1198,13 +1163,41 @@ func TestPipeline(t *testing.T) {
 				sink: &httpDatasetSink{Endpoint: "http://localhost:7777/datasets/fulltest/fullsync", Store: store},
 			}}
 			job := &job{id: "fs-1", pipeline: pipeline, runner: runner}
-			job.Run()
+			job.Run()*/
+
+			task := &scheduler.TaskConfiguration{
+				Id:        "fs-1",
+				BatchSize: 5,
+				Source: map[string]any{
+					"Type": "MultiSource",
+					"Name": "src",
+					"Dependencies": []any{
+						map[string]any{
+							"dataset": "dep",
+							"joins": []any{
+								map[string]any{
+									"dataset":   "src",
+									"predicate": ns + ":predicate",
+									"inverse":   false,
+								},
+							},
+						},
+					},
+				},
+				Sink: map[string]any{
+					"Type": "HttpDatasetSink",
+					"Url":  "http://localhost:7777/datasets/fulltest/fullsync",
+				},
+				Type: JobTypeIncremental,
+			}
+			pipeline, _ := builder.buildV2(task)
+			_ = pipeline.sync(context.Background())
 
 			sinkChanges := mockService.getRecordedEntitiesForDataset("fulltest")
 			g.Assert(len(sinkChanges)).Eql(2, "Expected only 2 entities")
 
 			syncJobState := &SyncJobState{}
-			err := store.GetObject(server.JOB_DATA_INDEX, job.id, syncJobState)
+			err := store.GetObject(server.JOB_DATA_INDEX, task.Id, syncJobState)
 			g.Assert(err).IsNil()
 			token := syncJobState.ContinuationToken
 			g.Assert(token).Eql("{\"MainToken\":\"2\",\"DependencyTokens\":{\"dep\":{\"Token\":\"3\"}}}",
@@ -1219,14 +1212,14 @@ func TestPipeline(t *testing.T) {
 			e.References[ns+":predicate"] = ns + ":1"
 			_ = depDs.StoreEntities([]*server.Entity{e})
 
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			sinkChanges = mockService.getRecordedEntitiesForDataset("fulltest")
 			g.Assert(len(sinkChanges)).Eql(1, "Expected only 1 entity (id=1 was linked to by dependency)")
 			g.Assert(sinkChanges[0].ID).Eql(ns+":1", "new dependency points to id 1")
 
 			syncJobState = &SyncJobState{}
-			err = store.GetObject(server.JOB_DATA_INDEX, job.id, syncJobState)
+			err = store.GetObject(server.JOB_DATA_INDEX, task.Id, syncJobState)
 			g.Assert(err).IsNil()
 			token = syncJobState.ContinuationToken
 			g.Assert(token).Eql("{\"MainToken\":\"2\",\"DependencyTokens\":{\"dep\":{\"Token\":\"4\"}}}",
@@ -1238,13 +1231,13 @@ func TestPipeline(t *testing.T) {
 			}
 
 			// run one more time without changes to source data, make sure nothing is done
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			sinkChanges = mockService.getRecordedEntitiesForDataset("fulltest")
 			g.Assert(len(sinkChanges)).Eql(0)
 
 			syncJobState = &SyncJobState{}
-			err = store.GetObject(server.JOB_DATA_INDEX, job.id, syncJobState)
+			err = store.GetObject(server.JOB_DATA_INDEX, task.Id, syncJobState)
 			g.Assert(err).IsNil()
 			token = syncJobState.ContinuationToken
 			g.Assert(token).Eql("{\"MainToken\":\"2\",\"DependencyTokens\":{\"dep\":{\"Token\":\"4\"}}}",
@@ -1261,30 +1254,34 @@ func TestPipeline(t *testing.T) {
 				server.NewEntity("4", 0),
 				server.NewEntity("5", 0)})
 
-			jobJson := ` {
-			"id" : "sync-uniondatasetsource-to-nullsink",
-			"triggers": [{"triggerType": "cron", "jobType": "fullsync", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "UnionDatasetSource",
-				"DatasetSources" : [{"Name":"src1"},{"Name":"src2"}]
-			},
-			"sink" : {
-				"Type" : "HttpDatasetSink",
-				"Url":"http://localhost:7777/datasets/fulltest/fullsync"
-			} }`
-
-			jobConfig, err := scheduler.Parse([]byte(jobJson))
+			task := &scheduler.TaskConfiguration{
+				Id: "fs-1",
+				Source: map[string]any{
+					"Type": "UnionDatasetSource",
+					"DatasetSources": []any{
+						map[string]any{
+							"Name": "src1",
+						},
+						map[string]any{
+							"Name": "src2",
+						},
+					},
+				},
+				Sink: map[string]any{
+					"Type": "HttpDatasetSink",
+					"Url":  "http://localhost:7777/datasets/fulltest/fullsync",
+				},
+				Type: JobTypeFull,
+			}
+			pipeline, err := builder.buildV2(task)
 			g.Assert(err).IsNil()
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeFull)
-			g.Assert(err).IsNil()
-			job := &job{id: "fs-1", pipeline: pipeline, runner: runner}
-			job.Run()
+			_ = pipeline.sync(context.Background())
 
 			sinkChanges := mockService.getRecordedEntitiesForDataset("fulltest")
 			g.Assert(len(sinkChanges)).Eql(5, "Expected 5 entities in current state in fullsync")
 
 			syncJobState := &SyncJobState{}
-			err = store.GetObject(server.JOB_DATA_INDEX, job.id, syncJobState)
+			err = store.GetObject(server.JOB_DATA_INDEX, task.Id, syncJobState)
 			g.Assert(err).IsNil()
 			token := syncJobState.ContinuationToken
 			g.Assert(token).Eql("",
@@ -1302,30 +1299,36 @@ func TestPipeline(t *testing.T) {
 				server.NewEntity("4", 0),
 				server.NewEntity("5", 0)})
 
-			jobJson := ` {
-			"id" : "sync-uniondatasetsource-to-nullsink",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "UnionDatasetSource",
-				"DatasetSources" : [{"Name":"src1"},{"Name":"src2", "LatestOnly": true}]
-			},
-			"sink" : {
-				"Type" : "HttpDatasetSink",
-				"Url":"http://localhost:7777/datasets/inctest/fullsync"
-			} }`
-
-			jobConfig, err := scheduler.Parse([]byte(jobJson))
+			task := &scheduler.TaskConfiguration{
+				Id: "inc-1",
+				Source: map[string]any{
+					"Type": "UnionDatasetSource",
+					"DatasetSources": []any{
+						map[string]any{
+							"Name": "src1",
+						},
+						map[string]any{
+							"Name":       "src2",
+							"LatestOnly": true,
+						},
+					},
+				},
+				Sink: map[string]any{
+					"Type": "HttpDatasetSink",
+					"Url":  "http://localhost:7777/datasets/inctest/fullsync",
+				},
+				Type: JobTypeIncremental,
+			}
+			pipeline, err := builder.buildV2(task)
 			g.Assert(err).IsNil()
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil()
-			job := &job{id: "inc-1", pipeline: pipeline, runner: runner}
-			job.Run()
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNil("failed to run")
 
 			sinkChanges := mockService.getRecordedEntitiesForDataset("inctest")
 			g.Assert(len(sinkChanges)).Eql(5, "Expected 5 entities in current state")
 
 			syncJobState := &SyncJobState{}
-			err = store.GetObject(server.JOB_DATA_INDEX, job.id, syncJobState)
+			err = store.GetObject(server.JOB_DATA_INDEX, task.Id, syncJobState)
 			g.Assert(err).IsNil()
 			token := syncJobState.ContinuationToken
 			g.Assert(token).Eql("{\"Tokens\":[{\"Token\":\"2\"},{\"Token\":\"3\"}],\"DatasetNames\":[\"src1\",\"src2\"]}",
@@ -1354,49 +1357,35 @@ func TestPipeline(t *testing.T) {
 				return entities;
 			}
 			`
-			jscriptEnc := base64.StdEncoding.EncodeToString([]byte(js))
 
-			// define job
-			jobJson := `
-		{
-			"id" : "sync-datasetsource-to-datasetsink-with-js",
-			"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-			"source" : {
-				"Type" : "DatasetSource",
-				"Name" : "Products",
-				"LatestOnly": "true"
-			},
-			"transform" : {
-				"Type" : "JavascriptTransform",
-				"Code" : "` + jscriptEnc + `"
-			},
-			"sink" : {
-				"Type" : "DevNullSink"
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-datasetsource-to-datasetsink-with-js",
+				Source: map[string]any{
+					"Type":       "DatasetSource",
+					"Name":       "Products",
+					"LatestOnly": true,
+				},
+				Transform: map[string]any{
+					"Type": "JavascriptTransform",
+					"Code": base64.StdEncoding.EncodeToString([]byte(js)),
+				},
+				Sink: map[string]any{
+					"Type": "DevNullSink",
+				},
+				Type: JobTypeIncremental,
 			}
-		}`
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil("pipeline is parsed")
+			pipeline, err := builder.buildV2(task)
+			g.Assert(err).IsNil()
 			g.Assert(pipeline.spec().source.(*source.DatasetSource).LatestOnly).IsTrue()
 
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
-			}
-
-			job.Run()
+			err = pipeline.sync(context.Background())
+			g.Assert(err).IsNotNil()
 
 			syncJobState := &SyncJobState{}
-			err = store.GetObject(server.JOB_DATA_INDEX, job.id, syncJobState)
+			err = store.GetObject(server.JOB_DATA_INDEX, task.Id, syncJobState)
 			g.Assert(err).IsNil()
 			g.Assert(syncJobState.LastRunCompletedOk).IsFalse()
 
-			jobResult := &jobResult{}
-			err = store.GetObject(server.JOB_RESULT_INDEX, job.id, jobResult)
-			g.Assert(err).IsNil()
-			g.Assert(jobResult.LastError == "").IsFalse()
 		})
 
 		g.It("Should support proxy dataset as incremental datasetSource", func() {
@@ -1406,32 +1395,21 @@ func TestPipeline(t *testing.T) {
 			g.Assert(err).IsNil()
 
 			// define job
-			jobJson := `
-			{
-				"id" : "sync-proxydatasetsource-to-httpdatasetsink",
-				"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-				"source" : {
-					"Type" : "DatasetSource",
-					"Name" : "proxy"
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-proxydatasetsource-to-httpdatasetsink",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "proxy",
 				},
-				"sink" : {
-					"Type" : "HttpDatasetSink",
-					"Url" : "http://localhost:7777/datasets/proxysink/fullsync"
-				}
-			}`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil("pipeline is parsed correctly")
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+				Sink: map[string]any{
+					"Type": "HttpDatasetSink",
+					"Url":  "http://localhost:7777/datasets/proxysink/fullsync",
+				},
+				Type: JobTypeIncremental,
 			}
+			pipeline, _ := builder.buildV2(task)
+			_ = pipeline.sync(context.Background())
 
-			job.Run()
 			g.Assert(len(mockService.RecordedEntities["proxysink"])).Eql(11, "sink received content")
 			g.Assert(mockService.RecordedEntities["proxysink"][1].ID).Eql("ns3:e-0", "sink received entity from proxy")
 		})
@@ -1443,32 +1421,21 @@ func TestPipeline(t *testing.T) {
 			g.Assert(err).IsNil()
 
 			// define job
-			jobJson := `
-			{
-				"id" : "sync-proxydatasetsource-to-httpdatasetsink",
-				"triggers": [{"triggerType": "cron", "jobType": "fullsync", "schedule": "@every 2s"}],
-				"source" : {
-					"Type" : "DatasetSource",
-					"Name" : "proxy"
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-proxydatasetsource-to-httpdatasetsink",
+				Source: map[string]any{
+					"Type": "DatasetSource",
+					"Name": "proxy",
 				},
-				"sink" : {
-					"Type" : "HttpDatasetSink",
-					"Url" : "http://localhost:7777/datasets/proxysink/fullsync"
-				}
-			}`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeFull)
-			g.Assert(err).IsNil("pipeline is parsed correctly")
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+				Sink: map[string]any{
+					"Type": "HttpDatasetSink",
+					"Url":  "http://localhost:7777/datasets/proxysink/fullsync",
+				},
+				Type: JobTypeFull,
 			}
+			pipeline, _ := builder.buildV2(task)
+			_ = pipeline.sync(context.Background())
 
-			job.Run()
 			ents := mockService.getRecordedEntitiesForDataset("proxysink")
 			g.Assert(len(ents)).Eql(10, "sink received content")
 			g.Assert(ents[0].ID).Eql("ns3:fs-0", "sink received entity from proxy")
@@ -1483,32 +1450,21 @@ func TestPipeline(t *testing.T) {
 			g.Assert(err).IsNil()
 
 			// define job
-			jobJson := `
-			{
-				"id" : "sync-proxydatasetsource-to-httpdatasetsink",
-				"triggers": [{"triggerType": "cron", "jobType": "incremental", "schedule": "@every 2s"}],
-				"source" : {
-					"Type" : "HttpDatasetSource",
-					"Url" : "http://localhost:7777/datasets/people/changeswithcontinuation"
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-proxydatasetsource-to-httpdatasetsink",
+				Source: map[string]any{
+					"Type": "HttpDatasetSource",
+					"Url":  "http://localhost:7777/datasets/people/changeswithcontinuation",
 				},
-				"sink" : {
-					"Type" : "DatasetSink",
-					"Name" : "proxy"
-				}
-			}`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeIncremental)
-			g.Assert(err).IsNil("pipeline is parsed correctly")
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "proxy",
+				},
+				Type: JobTypeIncremental,
 			}
+			pipeline, _ := builder.buildV2(task)
+			_ = pipeline.sync(context.Background())
 
-			job.Run()
 			var receivedMockRequests []*http.Request
 			wg := sync.WaitGroup{}
 			wg.Add(1)
@@ -1542,32 +1498,21 @@ func TestPipeline(t *testing.T) {
 			g.Assert(err).IsNil()
 
 			// define job
-			jobJson := `
-			{
-				"id" : "sync-proxydatasetsource-to-httpdatasetsink",
-				"triggers": [{"triggerType": "cron", "jobType": "fullSync", "schedule": "@every 2s"}],
-				"source" : {
-					"Type" : "HttpDatasetSource",
-					"Url" : "http://localhost:7777/datasets/people/changeswithcontinuation"
+			task := &scheduler.TaskConfiguration{
+				Id: "sync-proxydatasetsource-to-httpdatasetsink",
+				Source: map[string]any{
+					"Type": "HttpDatasetSource",
+					"Url":  "http://localhost:7777/datasets/people/changeswithcontinuation",
 				},
-				"sink" : {
-					"Type" : "DatasetSink",
-					"Name" : "proxy"
-				}
-			}`
-
-			jobConfig, _ := scheduler.Parse([]byte(jobJson))
-			pipeline, err := scheduler.toPipeline(jobConfig, JobTypeFull)
-			g.Assert(err).IsNil("pipeline is parsed correctly")
-
-			job := &job{
-				id:       jobConfig.Id,
-				pipeline: pipeline,
-				schedule: jobConfig.Triggers[0].Schedule,
-				runner:   runner,
+				Sink: map[string]any{
+					"Type": "DatasetSink",
+					"Name": "proxy",
+				},
+				Type: JobTypeFull,
 			}
+			pipeline, _ := builder.buildV2(task)
+			_ = pipeline.sync(context.Background())
 
-			job.Run()
 			var receivedMockRequests []*http.Request
 			wg := sync.WaitGroup{}
 			wg.Add(1)
